@@ -1,271 +1,266 @@
-**SIH26119** — Indigenous GPU-Accelerated Optimization Solver (Sovereign Alternative to CPLEX / Xpress)  
-Smart India Hackathon 2026 · Mangalore Refinery and Petrochemicals Limited (MRPL)
-
 # NIRNAY
 
-**Indigenous GPU-accelerated optimization solver — LP, MILP, convex QP, written from
-mathematical foundations.**
+**An indigenous, GPU-accelerated mathematical optimization solver — LP, MILP, convex QP and
+MIQP — written from mathematical foundations.**
 
-Smart India Hackathon 2026, problem statement **SIH26119**, issued by Mangalore Refinery and
-Petrochemicals Limited.
+Smart India Hackathon 2026 · Problem statement **SIH26119** — *Indigenous GPU-Accelerated
+Optimization Solver (Sovereign Alternative to Xpress / CPLEX)* · Mangalore Refinery and
+Petrochemicals Limited (MRPL).
 
-> Not built on top of any open-source solver. See [`docs/PROVENANCE.md`](docs/PROVENANCE.md)
-> for the dependency table, the full link line, the linked-library dump, and the CI job that
-> fails the build if a solver library ever appears in the binary.
+*Nirṇaya* (निर्णय) means *decision*. An optimization solver is a decision engine: given what a
+plant can do and what things cost, it decides what to do — and NIRNAY proves the decision
+is right before it reports it.
+
+> Not built on any existing solver. No source code from CPLEX, Gurobi, Xpress, HiGHS, SCIP,
+> CBC/Clp, GLPK, OSQP, PDLP or cuPDLP was copied, linked or read; every algorithm is
+> implemented from the published literature and cited beside its code. See
+> [`docs/PROVENANCE.md`](docs/PROVENANCE.md) for the dependency table, the citation of every
+> algorithm, the link line and the linked-library dump.
 
 ---
 
-## Status
+## Headline results
 
-| Phase | Scope | State |
+Every number below comes from a CSV in [`bench/results/`](bench/results/) that records the
+instance's sha256, both objectives, the status, the time, the git commit and the machine.
+The GPU rows were measured on **one 1g.45gb MIG slice of an NVIDIA B200 — about 1/7 of the
+card** — on a DGX-B200 node (Intel Xeon Platinum 8570); a full card has several times the
+bandwidth these runs had.
+
+| What | Result | Evidence |
 |---|---|---|
-| 1 | Foundations: model, options, sparse linear algebra, CI | **done** |
-| 2 | MPS/LP readers, revised primal simplex, CLI | **done** |
-| 3 | Verification spine: rational oracle, independent checker, Netlib harness | **done** |
-| 4 | Restarted PDHG — **CPU done**, its answer finished by the interior point by default since #229; CUDA backend not started (no GPU available) | partial |
-| 5 | Branch & bound → MILP | **done** (MIPLIB benchmarked; root cuts landed in #159 and are off by default, see below) |
-| 6–10 | Performance, branch & cut, IPM/QP, robustness, packaging | convex QP **done** (Phase 8, `src/qp/`); interior point **done, opt-in** (`src/ipm/`, no basis); robustness sweep **done** (`bench/runners/robustness.py`); root cuts **done, off by default** (#159, `src/mip/cuts.cpp`); machine-checkable certificates for infeasible and unbounded models **done** (#192, `src/core/certificate.cpp`, checked by `tools/verify_solution.py`); MIP gap targets **done** (#188); packaging **done** apart from the human items on #73 |
+| **Hourly refinery-planning year** — 779,640 rows × 1,208,880 columns, 10 million nonzeros | **optimal in 4.0 s** of solver time on the GPU slice (13 s including reading a 421 MB file), relative error 1.6e-14 against the optimum known by construction. 32 CPU threads: 9.4 s. The previous engine reached 1.1e-6 in 134 s and proved nothing. | `scale-refinery-nirnay-gpu.csv`, `scale-refinery-nirnay-cpu32.csv` |
+| **One million × one million LP** (random sparse, 5 million nonzeros) | **optimal in 233 s** on the GPU slice, relative error 5.6e-12. 32 CPU threads hit a 1,200 s limit without proving it. | `scale-random-nirnay-gpu.csv` |
+| **Scale families** (random, staircase, refinery; 1,000 to 1,000,000 rows) | **every solve reaches the analytic optimum** — to a relative 5e-11 or better — on GPU and CPU alike | `scale-*-nirnay-*.csv` |
+| **GPU vs 32 CPU threads**, same algorithm, same iterations | 20,000-row random: 17 s vs 145 s (8.4×); daily refinery year: 0.5 s vs 1.7 s | `scale-random-nirnay-*.csv`, `scale-refinery-nirnay-*.csv` |
+| **Netlib, full 89-instance set** | **80 of 89** match the published optimum to 1e-6 **and** pass independent verification (was 78). Of the nine that differ from Netlib's table, eight agree with HiGHS to 2.4e-12 or better — the published table is the outlier — and the ninth, `pilot87`, does too since the fix described below. | `netlib-full-nirnay-dgx.csv` |
+| **First-order engine efficiency** | the new PDHG needs 10–26× fewer iterations than the previous engine on the committed Netlib instances (e.g. `israel` 368,720 → 8,384) and reaches optimal on all nine with no finishing step | [`docs/THEORY.md`](docs/THEORY.md) §7.5 |
+| **Branch and bound throughput** | 2.85× more nodes per second after replacing the scanned open list with a heap (profiled: bookkeeping was 76% of the solve) | [`docs/THEORY.md`](docs/THEORY.md) §10.1 |
+| **MIPLIB 2017, 60 easy instances with a proven optimum**, 60 s each | 25 of 60 reach the published optimum, 14 of 60 also prove it — measured with the binary **before** the branch-and-bound heap and the new heuristics; the re-run with them is pending | `miplib-baseline-nirnay-dgx.csv` |
+| **Convex QP (Maros–Mészáros, instances ≤ 200 rows)** | 25 of 49 match the reference and verify — the weakest area today, stated rather than hidden | `maros-meszaros-le200rows-nirnay.csv` |
 
-LP is solved by a bounded-variable revised primal simplex (or restarted PDHG), MILP by
-branch and bound, and convex QP by a Condat-Vu primal-dual method — and MIQP by branch and
-bound over QP relaxations — all end to end from an MPS file through to an independently
-verified answer. **Non-convex** QP is the one class still refused, and refused deliberately
-rather than approximated: it is decided by an LDL^T semidefiniteness test before any
-arithmetic starts, and a negative pivot is returned as the certificate. Reporting a local
-optimum as a global one is the single most damaging thing this dispatcher could do, so it
-does not — see the evidence rules in [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md).
+A note on one Netlib instance, because it shows the method working: `pilot87` was reported as
+`feasible` in the committed evidence. NIRNAY now re-solves an optimum whose measurement falls
+short from its own final basis, which finds **301.710347333** — equal to HiGHS's
+301.71034733310745 to 1e-15, accepted by the independent verifier — and shows that Netlib's
+published 301.71072827 is off by 1.3e-6. (That fix landed after the Netlib CSV above was
+written; the CSV still records `pilot87` as `feasible`.)
 
-Benchmark results against Netlib, headline first: **78 of 89** on the full set — matched
-to the published optimum to a relative 1e-6 *and* passed independent verification —
-measured on `main` at `53cbe16` (`bench/results/netlib-full-53cbe16.csv`). The narrower
-tiers read higher (**48 of 50** on the medium tier, **9 of 9** on the small set the demo
-runs) because both are defined by a row cap, which makes them the easier half by
-construction; the full set is the number Phase 6's ">= 95% of Netlib" criterion is
-measured against, so it is the one quoted here. See
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), generated from the CSVs in `bench/results/` so
-it cannot drift.
+---
 
-The 11 non-passes are worth naming, and most of them are not wrong answers. Every one that
-produces an answer was cross-checked against **HiGHS**, a mature third-party solver run as a
-separate process, by `bench/runners/cross_check_highs.py`
-(`bench/results/cross-check-highs-adcee1b.csv`):
+## What PS26119 asks for, and what NIRNAY provides
 
-| what it is | count | instances |
-|---|---|---|
-| our answer verifies as optimal and agrees with HiGHS; Netlib's published table is the outlier (`e226` by its objective constant, the rest by up to 1.3e-03) | **7** | `80bau3b`, `e226`, `ganges`, `greenbea`, `greenbeb`, `nesm`, `scrs8` |
-| ran out of time at 120 s | **2** | `dfl001`, `pilot87` |
-| the answer agrees with HiGHS to 3.0e-07 and verifies; our own dual-feasibility check downgrades the status to `feasible`, and Netlib's table is off by 1.5e-04 | **1** | `pilot` |
-| the solver declined to answer: its phase-1 ratio test found no blocking variable and it reported a numerical error rather than a claim it could not stand behind | **1** | `maros-r7` |
+| Requirement | NIRNAY |
+|---|---|
+| LP, MILP, QP; modular for MIQP, NLP, MINLP | LP, MILP, convex QP **and MIQP** implemented; one `solve()` seam where a nonlinear engine plugs in ([`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) §6) |
+| Revised simplex | bounded **dual** simplex (default) and primal simplex: sparse Markowitz LU, hyper-sparse FTRAN, Devex, bound-flipping ratio test, perturbation, basis repair, iterative refinement |
+| Interior-point methods | Mehrotra predictor–corrector over a from-scratch sparse LDLᵀ with approximate-minimum-degree ordering |
+| GPU acceleration "where it provides measurable benefits" | **restarted PDHG on CUDA** — measured above; every vector stays on the device |
+| Branch and bound, branch and cut, cutting planes | branch and bound with reliability branching and warm-started dual node LPs; root Gomory and lifted cover cuts |
+| Presolve | eight reductions with dual-aware postsolve |
+| Heuristics, advanced node selection | rounding, diving, **feasibility pump**, **RINS**; depth-first diving then best-bound from a heap |
+| Sparse techniques, multi-core parallelism | sparse throughout; OpenMP (deterministic at any thread count); a **concurrent optimizer** racing engines in parallel |
+| Numerical stability, reliable convergence | scaling, measured status guard, certificates for infeasible/unbounded, independent verification ([`docs/THEORY.md`](docs/THEORY.md) §12–13) |
+| MIPLIB / Netlib / Mittelmann, compared with an established solver | runners and fetchers for all three plus Maros–Mészáros; HiGHS as a separate-process comparison |
+| API or CLI | a CLI, a C API, and Python bindings |
+| Refinery, blending, planning, dispatch, supply chain | case studies and a generator for refinery-planning LPs of any horizon with the optimum known exactly |
 
-So: **on every Netlib instance where this solver produces a final answer, that answer
-agrees with HiGHS** - nine of the twelve rows in that CSV agree to 3.0e-07 or better. The
-three that differ are `dfl001` and `pilot87`, whose rows there are unfinished iterates
-rather than answers, and `maros-r7`, which has none. What remains is speed on two
-instances, our own status reporting on one, and one instance without an answer.
+---
 
-The machine's speed state is part of the evidence, so it is stated, and on this laptop it
-decides exactly one instance. `pilot87` needs **26,226 iterations** to reach its optimum -
-run it under `--option iteration_limit=27000` and it gets there every time, at objective
-301.710691459, with one basis repair - and whether those iterations fit inside the 120 s
-limit depends on how fast the machine is that minute. It fitted at `adcee1b` (55.9 s) and
-did not at `53cbe16` (the run above), which is the whole of the difference between 79 of
-89 and 78 of 89 on this hardware. Nothing else moves: 86 of the 89 rows are identical in
-status, iteration count and objective between the two runs, and the other two are
-`dfl001`, truncated wherever the clock leaves it, and `fit2p`, which takes the scaled or
-the unscaled route depending on the same clock (#172). The table above is the slower, more
-conservative run.
+## The engines
 
-This mattered because our own verifier could not settle it — it re-derives the answer from
-the same file we read, so agreeing with it shows only that our two readers agree, and both
-were written by this project (#75). Two independent solvers landing on the same number is a
-different order of evidence. The pass rate above is still measured against Netlib's table,
-unchanged: a project cannot grade itself against a solver of its own choosing.
+**LP.**
+- **Dual simplex** (the default below 1,000 rows) and **primal simplex**. Exact vertices, a basis, and shadow prices.
+- **Interior point** (`algorithm=ipm`).
+- **Restarted PDHG** (`algorithm=pdhg`, `--gpu` for the CUDA backend). A first-order method that scales to millions of variables. Its default scheme is reflected restarted Halpern PDHG with a constant step; PDLP's adaptive scheme is also available.
+- **Concurrent** (`algorithm=concurrent`, and what `auto` does at or above 1,000 rows). Races the dual simplex, PDHG (on the GPU when present) and the interior point in parallel threads. The first answer proved optimal wins and interrupts the rest.
+- **Finishing steps.** PDHG answers that stop short are polished by the interior point. First-order answers are **crossed over** to an optimal basis (`crossover=auto|on|off`). A simplex optimum that measures short is re-solved from its own basis with tighter tolerances.
 
-The failure class that *was* the largest is gone from Netlib. `basis became singular` was
-13 of 23 failures at `ca6fde9` (`bench/results/netlib-full-ca6fde9.csv`, 2026-08-31) and
-has been **zero on the full Netlib set** since #144 found the pivot search treating "none
-of my first four candidates was admissible" as proof of singularity and #147 repaired the
-genuine rank defects that remained. It is not zero everywhere: on Mittelmann's `qap15` the
-unscaled retry went singular at iteration 13,954 (`bench/results/mittelmann-592aea3.csv`,
-issue #174), the first reappearance in the evidence and on the Mittelmann instance closest
-to Netlib's size. Since then the dual simplex became the automatic engine (#165),
-reliability branching landed (#166), presolve's postsolve runs its dual passes to a fixed
-point (#162), and the FTRAN went hyper-sparse (#169): between them the full set went from
-71 to 78 verified passes, and `degen3`, which took 123.6 s, takes 0.9 s
-(`bench/results/netlib-full-53cbe16.csv`).
+**MILP.** Branch and bound with these components:
+- bound propagation and reliability branching (pseudocosts plus strong branching);
+- warm-started dual simplex node LPs;
+- rounding, diving, the feasibility pump and RINS;
+- optional root cuts;
+- gap targets.
 
-That is a better class of problem to have, and a different roadmap: speed on the three
-largest instances rather than robustness. Tracked in #214 (the four non-passes that are
-ours to fix) and #210 (the dual simplex's iteration rate at size).
+**QP and MIQP.** Convexity is decided first. A non-convex model is refused with a certificate, never solved to a local point. Convex models go to a Condat–Vũ primal–dual method, and MIQP to branch and bound over QP relaxations with conservative pruning.
 
-MIPLIB 2017 is benchmarked too: **13 of 30** easy instances reach the published optimum,
-**9 of 30** also prove it (`bench/results/miplib-f7ca7e9.csv`, 60 s; it was 6 of 30 at
-`53cbe16`, before #188 let a search that meets its gap target say `optimal` - three of the
-nine are that renamed status, not a better search) - branch and bound has reliability
-branching and warm-started node LPs, and root cutting planes that are off by default: on the
-same commit they prove the same nine, take the node count to 0.918x, and cost one published
-match (`noswot`'s incumbent worsens from -41 to -39 with them on; `bench/results/miplib-
-cuts-{off,on}.csv`, `docs/BENCHMARKS.md` section 2), so it finds good incumbents far more
-often than it closes the bound. For
-scale beyond what Netlib tests, `bench/runners/generate_large_lp.py` builds sparse LPs of
-any size with an exactly known analytic optimum, and `bench/runners/mittelmann.py` runs
-Mittelmann's LP set: on its eight smallest instances (6,330 to 376,500 rows) the result is
-**0 of 8** inside 300 s - eight time limits, now that `qap15` no longer ends in a singular
-basis (#174, fixed in #178) - every one named in section 1d of `docs/BENCHMARKS.md`
-(`bench/results/mittelmann-f7ca7e9.csv`, run on `main`, on AC, alone on the machine). The
-overrun on `bdry2`, whose time limit cannot reach inside the sparse LU (#208), is 380 s
-against 300 where it was 648.
+**Every answer** is re-measured against the original model before it's reported:
+- `optimal` carries a dual certificate;
+- `infeasible` carries a Farkas vector;
+- `unbounded` carries a ray.
 
-## Reproduce everything
+All three can be checked with `tools/verify_solution.py`, which shares no code with the solver.
 
-One command takes a fresh clone to every claim on this page - build, tests, the Netlib
-benchmark with independent verification, the HiGHS comparison, and the full PS26119
-walkthrough:
+The mathematics of all of this is in [`docs/THEORY.md`](docs/THEORY.md).
 
-```bash
-scripts/reproduce.sh
-```
+---
 
-It runs **offline**: the Netlib instances it benchmarks are committed, with their published
-optima. Add `--fetch-medium` to also download and run the 50-instance medium tier; the
-full 89-instance set, where the headline number above comes from, is
-`bench/runners/fetch_data.py --set full` followed by
-`bench/runners/netlib.py --time-limit 120`. Any step that cannot run on your machine prints why and is
-listed again in the summary, so a shorter run is never mistaken for a passing one.
+## Quick start
 
-To check the machine without running anything:
+### Build (CPU)
 
-```bash
-scripts/preflight.sh
-```
-
-It names the two things that most often go wrong quietly - a `python3` that is the Microsoft
-Store stub, and Windows Smart App Control refusing to execute a freshly linked binary - and
-prints the fix for each.
-
-## Build
-
-Requires CMake 3.20+, Ninja, and a C++20 compiler (GCC 10+ / Clang 12+ / MSVC 19.30+).
+Requires CMake ≥ 3.20, Ninja and a C++20 compiler (GCC ≥ 10, Clang ≥ 12, MSVC ≥ 19.30).
 
 ```bash
 scripts/configure.sh build Release
 cmake --build build -j
-ctest --test-dir build --output-on-failure
+ctest --test-dir build -j        # 483 tests
 ```
 
-`scripts/configure.sh` picks a C++20-capable compiler rather than trusting PATH order,
-which matters on Windows boxes carrying an old MinGW. It also reuses dependency sources
-from any build tree already on disk, so a second build directory costs seconds rather than
-re-cloning 200 MB. 453 tests, all passing - `ctest --test-dir build` is the check, and
-the number is worth reading with a command beside it rather than taken on trust.
+### Build (GPU)
 
-## Use
+Requires the CUDA toolkit, version 12.8 or newer for a B200 (`sm_100`), no newer than your driver supports (`nvidia-smi` shows the limit). Compiling needs no GPU.
 
 ```bash
-./build/nirnay version
-./build/nirnay options
-./build/nirnay info  demo/crude_blend.mps
+scripts/build_cuda.sh                 # build-cuda/, architectures 80;90;100 (A100, H100, B200)
+scripts/build_cuda.sh build-b200 100  # a B200-only build
+```
+
+`build_cuda.sh` finds `nvcc` on `PATH`, under `$CUDA_HOME`, under `/usr/local/cuda*`, or in a conda environment. On a cluster that has the driver but no toolkit, create the environment:
+
+```bash
+conda create -n nirnay -c nvidia/label/cuda-12.8.1 cuda-nvcc cuda-cudart-dev cuda-cccl \
+                       libcusparse-dev cmake ninja
+```
+
+Then run the script without activating the environment. The script explains why at its top.
+
+### Solve
+
+```bash
 ./build/nirnay solve demo/crude_blend.mps --write-sol blend.sol --stats blend.json
-./build/nirnay solve demo/crude_blend.mps --progress-out progress.jsonl
+./build/nirnay solve model.mps --gpu                          # PDHG on the GPU
+./build/nirnay solve model.mps --option algorithm=concurrent  # race the engines
+./build/nirnay solve model.mps --progress-out progress.jsonl  # tail -f it during a long solve
+./build/nirnay options                                        # every option, with its default
+python3 tools/verify_solution.py demo/crude_blend.mps blend.sol   # independent check
 ```
 
-`demo/crude_blend.mps` is a small crude-blending LP: three crudes into a diesel pool, with a
-CDU throughput window, a diesel commitment and a sulphur specification. It ships as both MPS
-and LP so the two readers can be checked against each other, and it exercises the format
-features most likely to be misread - a `RANGES` entry on a `G` row, an equality row,
-`OBJSENSE MAX`, and `LO`/`UP` bounds.
+`solve` exits `0` for optimal, `1` for a limit or a proven infeasible/unbounded model, `3` when the file can't be read, and `5` for a numerical or model error. Ctrl-C stops a solve and returns the best point found so far.
 
-`solve` returns a meaningful exit code: `0` optimal, `1` a limit or a proven
-infeasible/unbounded model, `3` the file could not be read, `5` a numerical or model error.
+The solution file carries the **shadow price of every row**. On the blending model, those are the numbers a refinery planner acts on: what one more unit of diesel commitment costs, and what the sulphur specification is worth.
 
-Beyond the objective, the solution file carries the **shadow price of every row**. On the
-blending model those are the numbers a refinery planner acts on: what one more unit of
-diesel commitment costs, and what the sulphur specification is worth.
+### Python
 
-A verdict of *infeasible* or *unbounded* is not taken on trust either. Since #192 the
-solution file carries a **certificate** with it - a Farkas vector for an infeasible model, a
-ray for an unbounded one - and `tools/verify_solution.py`, which shares no code with the
-solver, checks the certificate against the original model the same way it checks an
-optimal point. The header says `certificate farkas`, `ray` or `none`, so a verdict that
-arrives without one (a model presolve proved infeasible, say) is visible as such.
+```python
+import nirnay                                   # bindings/python, ctypes over the C API
+model = nirnay.Model.read("data/netlib/afiro.mps")
+result = model.solve(algorithm="concurrent")
+print(result.status, result.objective)          # optimal -464.753142857...
+```
 
-A MILP stopped by a gap target (`--option mip_relative_gap=0.01`) reports *optimal within
-the gap* and the file records the gap it was asked for (#188); a run that stops on a limit
-reports the incumbent as what it is. Time limits reach inside the sparse LDL^T factorization
-(#197), so an interior-point solve on a model whose factor is too large stops on time
-rather than when the factorization happens to finish; the sparse LU used by the simplex
-does not yet honour it the same way (#208).
+---
 
-`--progress-out` appends one JSON line per logged iteration or node to a file as the solve
-runs, flushed immediately - an operator can `tail -f` it during a long solve to watch the
-bound close in on the answer without waiting for the final report.
+## Running on the B200 cluster (Slurm)
 
-## Demo
+The DGX-B200 is shared, so batch jobs are the way in. Build on the login node, then:
 
 ```bash
-demo/run_sih_demo.sh         # the full PS26119 walkthrough, in the problem statement's order
-demo/run_demo.sh --list      # or pick a single instance
-demo/run_demo.sh share2b     # solve it live, then verify it independently
+sbatch bench/slurm/b200_evidence.sbatch        # a full B200: scale, Netlib, Mittelmann,
+                                               # MIPLIB, Maros-Meszaros
+sbatch -p small-b200 --gres=gpu:nvidia_b200_1g.45gb:1 \
+       --export=ALL,NIRNAY_MACHINE_TAG=dgx-b200-mig1g45 bench/slurm/b200_evidence.sbatch
 ```
 
-The nine Netlib instances are committed, so the demo needs no network. Every number it prints
-comes from a command it just ran.
+`NIRNAY_MACHINE_TAG` is recorded in every CSV row. Name a MIG slice as a slice.
 
-On Windows, run it as `PYTHON=python demo/run_sih_demo.sh` if `python3` on your PATH is the
-Microsoft Store stub; `scripts/preflight.sh` tells you whether it is.
+---
 
-## Layout
+## Benchmarks: fetch, run, reproduce
 
-```
-include/nirnay/  public headers — Model, Solution, Options, tolerances, sparse containers
-                  plus nirnay.h, the C API
-src/api           C API — an FFI-safe surface over the core, no C++ types crossing
-src/core          Model/Solution implementation, the solve() dispatcher, certificates (#192)
-src/util          logging, timers, arena allocator, option registry
-src/io            MPS + LP readers (including QPS QUADOBJ), solution and JSON writers
-src/presolve      reductions + postsolve               (on by default)
-src/simplex       primal and dual revised simplex (the dual is the branch-and-bound node engine)
-src/la            sparse containers, sparse Markowitz LU (hyper-sparse FTRAN), sparse LDL^T, dense LU (test oracle only)
-src/pdhg          restarted PDHG, CPU; its answer is finished by the interior point (#229)
-                                                       (CUDA backend: not started)
-src/mip           branch and bound + diving heuristic + root cuts (cuts off by default, #159)
-src/qp            convex QP, Condat-Vu primal-dual     (done)
-src/ipm           Mehrotra interior point, sparse LDL^T (opt-in: algorithm=ipm, no basis)
-bindings/python   Python bindings — ctypes over the C API, nothing to compile
-tests/  bench/  tools/  docs/  demo/
+```bash
+python3 bench/runners/fetch_data.py --set full          # Netlib, 89 instances + published optima
+python3 bench/runners/fetch_miplib.py --count 60        # MIPLIB 2017 easy instances with =opt=
+python3 bench/runners/fetch_mittelmann.py --set full    # Mittelmann LP set (~26 GB decoded)
+python3 bench/runners/fetch_maros_meszaros.py           # 138 convex QPs + reference optima
+
+python3 bench/runners/netlib.py --time-limit 120
+python3 bench/runners/miplib.py --time-limit 60
+python3 bench/runners/mittelmann.py --time-limit 300
+python3 bench/runners/maros_meszaros.py --time-limit 60
+python3 bench/runners/scale.py --structure refinery --sizes 12 365 8760 --engines pdhg \
+        --solver-option gpu=true                        # optimum known by construction
+python3 bench/runners/cross_check_highs.py              # every disagreement vs HiGHS
+scripts/reproduce.sh                                    # a fresh clone to every claim, offline
 ```
 
-## What this does NOT do
+Each runner writes a CSV to `bench/results/` with the instance hash, both objectives, the gap, the status, the time, the iterations or nodes, the commit (suffixed `-dirty` when the tree is modified) and the machine. `docs/BENCHMARKS.md` is generated from those CSVs. The nine Netlib instances the demo uses are committed, so the demo needs no network.
 
-Stated here rather than only in the demo, because a solver that is vague about its limits is
-not one an industrial user can plan around. [Issue #54](https://github.com/thegoodengineer/sih-26/issues/54)
-tracks every PS26119 requirement against what exists on `main`; section 6 of
-`demo/run_sih_demo.sh` prints this list at the end of every run.
+```bash
+demo/run_sih_demo.sh        # the PS26119 walkthrough, in the problem statement's order
+demo/run_demo.sh share2b    # solve one instance live, then verify it independently
+```
 
-| not implemented | note |
+---
+
+## Useful options
+
+| Option | Default | What it does |
+|---|---|---|
+| `algorithm` | `auto` | `auto`, `dual-simplex`, `simplex`, `ipm`, `pdhg` or `concurrent`. `auto` runs the dual simplex below `concurrent_min_rows` (1,000) and the race above; with `--gpu` it runs PDHG |
+| `gpu` / `--gpu` | off | PDHG on the CUDA device (`gpu_device` picks one) |
+| `pdhg_method` | `auto` (= `halpern`) | `halpern` (reflected restarted Halpern, constant step) or `adaptive` (PDLP) |
+| `crossover` | `auto` | `on`, `off` or `auto`. `auto` runs on small models, and on any answer not already optimal, within a bounded budget |
+| `time_limit`, `iteration_limit`, `node_limit` | none | limits; a limit returns the best point as exactly that |
+| `mip_relative_gap` | 1e-4 | the MIP stops as optimal within this gap |
+| `mip_heuristics` | on | feasibility pump and RINS |
+| `enable_root_cuts` | off | Gomory and cover cuts at the root (off by measurement) |
+| `threads` | 1 | OpenMP threads (0 = all cores); answers identical at any count |
+| `presolve` | on | reductions with dual-aware postsolve |
+
+`nirnay options` prints every option with its default, its range and the measurement behind it.
+
+---
+
+## Repository layout
+
+```
+include/nirnay/   public headers: Model, Solution, Options, tolerances, nirnay.h (the C API)
+src/core          solve() dispatcher, status guard, certificates, the concurrent race
+src/simplex       dual and primal simplex, crossover
+src/pdhg          PDHG driver (Halpern / adaptive), backend interface, CPU backend
+src/gpu           CUDA backend (cuSPARSE, fused kernels, deterministic reductions)
+src/ipm           Mehrotra interior point
+src/la            sparse matrices, LU, LDL^T with AMD, equilibration
+src/mip           branch and bound, root cuts, feasibility pump, RINS
+src/qp            convexity test, Condat-Vu convex QP
+src/presolve      reductions and postsolve
+src/io            MPS / QPS / LP readers, .sol and JSON writers
+src/api           C API;  bindings/python: ctypes bindings;  apps/nirnay-cli: the CLI
+tools/            verify_solution.py - the independent verifier
+tests/            unit tests, the exact rational oracle, robustness sweeps
+bench/            fetchers, runners, generators, results (CSVs), Slurm scripts
+demo/             the PS26119 walkthrough and small industrial models
+data/             committed Netlib instances, case studies, reference manifests
+docs/             theory, architecture, provenance, benchmarks, coverage, contributing
+```
+
+## Documentation
+
+| Document | What it is |
 |---|---|
-| **GPU acceleration** | The first-order method it needs exists and runs on CPU - restarted PDHG, `--option algorithm=pdhg`, **9 of 9** committed instances to `optimal` at 1e-8 on `main` at `79ec7f7` (`bench/results/pdhg-79ec7f7.csv`, `docs/BENCHMARKS.md` section 1e). The ninth is `share2b`, which the first-order method alone leaves at its million-iteration limit: since #229 its answer is finished by the interior point by default (`pdhg_polish`), nine more iterations there, and section 1f.1 measures the same thing size by size - 6.1e-04 to 1.9e-10 at 1,000 rows, declined where the factor is not affordable. The CUDA backend is unwritten (#16-#19); `--gpu` warns and falls back. No speed-up is claimed. |
-| **Scale** | Measured to a million, and the answer depends on the engine (#198, `docs/BENCHMARKS.md` sections 1f and 1f.1). On generated instances whose optimum is exact by construction: under a 120 s clock the first-order engine reaches the optimum at **100,000 x 100,000** to 9.1e-08 without certifying it, the interior point reaches it at 5,000 since the AMD ordering (#193) and the dual simplex only at 1,000 (`bench/results/scale-f7ca7e9.csv`, 7 of 12). Given a fixed 1,000 iterations instead of a clock - the one accuracy claim here another machine reproduces exactly - the error stays between 6.9e-06 and 6.1e-04 all the way to **1,000,000 x 1,000,000**, so what grows with the model is the cost per iteration, not the number needed. Those are the random family's numbers, and a random sparse matrix is the worst case for anything that factorizes; on a second family shaped like a multi-period planning model (#198, section 1f.2, `bench/results/scale-staircase-6503800.csv`) the interior point reaches the optimum at **20,000** rows instead of 1,000 and 8 of 12 solves reach it against 6 of 12. The polish that finishes PDHG's answer (#229) is measured beside the unpolished run in section 1f.1 (`bench/results/scale-iterations-f7ca7e9.csv`): at 1,000 rows the same 1,000 iterations land at 6.1e-04 unpolished and 1.9e-10 polished, and at every larger size of the random family the polish declines within its 30 s budget because the factor is dense, which the table shows rather than hides. On real models: the largest Netlib instance solved is `fit2d`, 25x10500 with 129018 nonzeros, in 0.3 s, and on Mittelmann's eight smallest LPs, 6,330 to 376,500 rows, the result is 0 of 8 inside 300 s. On an industrial-structured model - a T-period refinery planning LP with crudes, tanks, yields, capacities, quality budgets and delivery commitments, optimum exact by construction (`bench/runners/generate_refinery_lp.py`, #211, section 1f.3, `bench/results/scale-refinery-f7ca7e9.csv`) - the monthly year (1,068 rows) is solved exactly by all three engines, the daily year (**32,485 rows**) exactly by the interior point (45 iterations, 93 s) and by PDHG finished by it (95 s), and the hourly year (**779,640 rows**) is reached by PDHG to 1.1e-06 inside 120 s and proved by nothing: 5 of 9 solves. That is the first industrial-shaped model at this size the evidence holds, and the number to read is the daily year. |
-| **Interior point as a default** | An interior-point method exists (#56, `--option algorithm=ipm`, Mehrotra predictor-corrector over a from-scratch sparse LDL^T) and is opt-in: it produces no basis, so it cannot warm-start branch and bound and cannot certify infeasibility, and on the full Netlib set it verifies fewer instances than the dual simplex (`docs/PS26119_COVERAGE.md`). The default continuous engine is the simplex. It does two things by default now that it did not: it stops the moment its iterate is not a number and returns the best finite one (#205, found on the 20,000-row staircase model), and it finishes PDHG's answers from PDHG's own point (#229), declining within `polish_max_seconds` when the factor is not affordable. |
-| **Cutting planes by default** | Root Gomory mixed-integer and lifted knapsack cover cuts exist (#159, `--option enable_root_cuts=true`) and are off by default: on the 30-instance MIPLIB set at 60 s on `main` at `f7ca7e9` they prove the same 9 instances, take the node count to 0.918x, and cost one published match (`noswot`, whose incumbent is -39 with them and -41 without), because a cut row makes every node LP dearer (`bench/results/miplib-cuts-{off,on}.csv`; `docs/BENCHMARKS.md` section 2). No MIR cuts, and none below the root (#221). Branch and bound itself has reliability branching (#69) and warm-started dual node LPs (#65). This is why MIPLIB proves few optima. |
-| **Non-convex QP** | Refused deliberately, with an LDL^T certificate. A local optimum reported as a global one is not something this solver will do. |
-| **MIQP bound quality** | MIQP is implemented, but its node bound comes from a first-order method and is only accurate to the tolerance it converged to, so pruning is deliberately kept on the conservative side and costs nodes. With root cuts off by default too, expect incumbents more often than proofs. |
-| **Parallelism** | Single-threaded by default. `--option threads=N` runs the column loops of an iteration under OpenMP, deterministically - results are bit-identical at 1 and 8 threads - and at Netlib scale it is measured to buy nothing, because an iteration is too short to amortize the fork (#57). It is a correctness-preserving switch, not a speed claim. |
+| [`docs/THEORY.md`](docs/THEORY.md) | the mathematics: duality, simplex, interior point, PDHG and its GPU mapping, crossover, concurrency, branch and bound, heuristics, QP, robustness, verification |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | the map of the code, the solve flow, the GPU data path, where new engines plug in |
+| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | benchmark tables generated from the CSVs |
+| [`docs/PS26119_COVERAGE.md`](docs/PS26119_COVERAGE.md) | the problem statement, requirement by requirement |
+| [`docs/PROVENANCE.md`](docs/PROVENANCE.md) | dependencies, algorithm citations, link line, SBOM, judgement calls |
+| [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) | the rules every change is held to: provenance, evidence, numerics, determinism |
 
-On speed against HiGHS: on the medium tier the objectives agree on all 50 instances, and
-the speed ratio is, for the first time, a number two runs an hour apart agree on. Three
-runs of the same binary on `main` at `f7ca7e9` (`bench/results/compare-highs-medium-
-f7ca7e9.csv`, `-second.csv`, `-third.csv`; 16:17, 16:41 and 17:21 on the same afternoon,
-alone on the machine, on mains) put the median per-instance ratio at **2.01x, 2.04x and
-2.12x** - NIRNAY slower - with total solve time 2.64x, 2.56x and 2.62x. The first and the
-third are an hour apart and agree within 6%, which is the bar #212 set for quoting it;
-the earlier committed pair, three days apart, had read 1.38x and 2.11x, and that spread is
-why the number was not quoted before. Read it as *about twice HiGHS's time on these
-instances, on this laptop*: 9 to 16 of the 50 timing envelopes still overlap outright,
-the instances solve in single-digit milliseconds, and the ratio belongs to this machine
-state as much as to the solver.
-The reproducible comparison is iteration count, where the gap narrowed by a third when
-devex pricing became the default (#66); HiGHS's devex still takes fewer.
+---
+
+## What NIRNAY does not do yet
+
+Stated plainly, because a solver that is vague about its limits isn't one an industrial user can plan around.
+
+| | |
+|---|---|
+| **Convex QP accuracy** | The QP engine is first-order, and on the small Maros–Mészáros instances 25 of 49 reach the reference. An interior point for QP (on the augmented system) is the next engine. |
+| **Hard MILPs** | Branch and bound finds good incumbents far more often than it proves optimality on the harder MIPLIB instances. There are no MIR cuts, no cuts below the root, and no parallel tree search yet. |
+| **Large LPs with the simplex** | The dual simplex's iteration rate falls off beyond ~10,000 rows, so crossover to a vertex is cheap on small and medium models but not at a million rows. At that size the answer is PDHG's, verified to 1e-7 absolute feasibility and a 1e-9 relative gap, without a basis. |
+| **Mittelmann's large LPs** | The runner exists and the set is fetched. A full-card B200 run with the concurrent engine is pending; the last committed laptop run finished 0 of 8. |
+| **NLP / MINLP** | Not attempted. The architecture leaves the seam for it. |
+| **Determinism of `concurrent`** | Every single engine is bit-for-bit deterministic. The race is not: on a model with several optimal vertices, which one is reported can vary between runs, though each is verified. |
 
 ## Licence
 
