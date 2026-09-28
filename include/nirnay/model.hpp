@@ -1,0 +1,414 @@
+// SPDX-License-Identifier: Apache-2.0
+// NIRNAY - the frozen model and solution interface.
+//
+// FROZEN INTERFACE (docs/CONTRIBUTING.md). Model is what every reader produces and every engine
+// consumes. Solution is what every engine produces. solve() is the single seam where the
+// simplex, PDHG, IPM, QP and branch-and-cut engines plug in. Changing anything in this
+// file breaks work in three directories at once, so it does not change without an explicit
+// decision recorded in the commit message.
+//
+// Two design choices here exist purely so that later phases do not force a rewrite:
+//
+//  1. ROWS CARRY TWO-SIDED BOUNDS. A row is  row_lower[i] <= a_i . x <= row_upper[i].
+//     Equality is lower == upper; a <= row has lower = -inf; a >= row has upper = +inf; a
+//     free (MPS "N") row that is not the objective has both infinite. This is exactly the
+//     shape the MPS RANGES section produces, so the reader never has to invent slack
+//     variables, and the dual simplex bound-flipping ratio test in Phase 6 gets the
+//     two-sided form it needs for free.
+//
+//  2. THE QUADRATIC OBJECTIVE AND INTEGRALITY MARKERS ARE PRESENT FROM DAY ONE, even
+//     though Phase 2 solves only LPs. An LP simply has an empty hessian and all-continuous
+//     columns. This is what "modular and extensible to MIQP/NLP/MINLP" costs at this stage:
+//     a few unused fields, versus a model-format migration later.
+//
+// Objective (before ObjSense is applied):
+//     objective_offset  +  c . x  +  0.5 * x^T Q x
+// Q is symmetric and stored LOWER-TRIANGULAR INCLUDING THE DIAGONAL. Only the stored half
+// is kept; the 0.5 factor and the symmetry are applied by whoever evaluates it. This is
+// the QPS convention, so a QPLIB/QPS reader maps onto it without a transformation.
+#pragma once
+
+#include <string>
+#include <vector>
+
+#include "nirnay/options.hpp"
+#include "nirnay/sparse.hpp"
+#include "nirnay/tolerances.hpp"
+#include "nirnay/types.hpp"
+
+namespace nirnay {
+
+class SolveControl;  // solve_control.hpp; forward-declared so this header stays light.
+
+/// Direction of optimization. Stored on the model rather than folded into the cost vector
+/// so that reported duals and reduced costs keep the sign convention of the original file.
+enum class ObjSense { kMinimize, kMaximize };
+
+/// Per-column variable class. Binary is not a separate kind: it is kInteger with bounds
+/// [0, 1], which is what the MPS BV bound type produces and what branching expects.
+enum class VarType : std::uint8_t { kContinuous, kInteger };
+
+/// Basis status of a column or row. Reported by the simplex, consumed by warm starting and
+/// by branch-and-cut. First-order engines (PDHG) leave everything kUnknown - they produce
+/// no basis, and that is a documented limitation, not a defect.
+enum class BasisStatus : std::uint8_t {
+  kUnknown,
+  kBasic,
+  kAtLower,
+  kAtUpper,
+  kNonbasicFree,  // free variable held at zero
+  kFixed          // lower == upper
+};
+
+/// Terminal state of a solve. Every engine must set exactly one of these.
+enum class SolveStatus : std::uint8_t {
+  kNotSolved,
+  kOptimal,
+  kInfeasible,
+  kUnbounded,
+  /// Detected as "not both feasible and bounded" without separating the two cases. Some
+  /// first-order methods legitimately stop here; reporting it honestly beats guessing.
+  kInfeasibleOrUnbounded,
+  /// A feasible point exists and is reported, but optimality was not proven: a node or time
+  /// limit hit with an incumbent in hand, or a first-order method that met its request but
+  /// not the project standard. A MIP that met its gap target reports kOptimal with the
+  /// achieved gap in the message (#188).
+  kFeasible,
+  kIterationLimit,
+  kTimeLimit,
+  kNodeLimit,
+  /// Stopped by a SolveControl (include/nirnay/solve_control.hpp, #223): a caller's
+  /// progress callback asked to stop, or another thread called SolveControl::interrupt().
+  /// Like the limit states, this normally stops with a point in hand - the incumbent, or
+  /// the last feasible iterate - which is what makes Ctrl-C during a solve useful instead
+  /// of merely safe.
+  kInterrupted,
+  kNumericalError,
+  kModelError
+};
+
+/// Does a solve ending in this state hand back a point?
+///
+/// The question a writer, a checker and a caller all have to answer, asked once here so they
+/// cannot answer it differently (#200). Getting it wrong in the permissive direction is what
+/// #191 was: an `infeasible` answer was written as a full all-zero point, and the project's
+/// own independent checker read that point, found it violated the rows, and printed REJECTED
+/// at a correct answer. That was fixed for `infeasible` alone, and every other verdict with
+/// nothing to show kept the bug.
+///
+/// `kUnbounded` says yes deliberately. Since #191 it carries the feasible point its ray
+/// starts from, because a ray that begins outside the feasible region proves nothing, and a
+/// checker needs both halves.
+///
+/// The limit states say yes because they normally stop with an iterate or an incumbent in
+/// hand. The one exception is a node limit reached before branch and bound found any integer
+/// point, which reports no objective and infinite gaps rather than a point (see
+/// `src/mip/branch_and_bound.cpp`); that case predates this predicate and is unchanged by it.
+[[nodiscard]] constexpr bool claims_a_point(SolveStatus status) noexcept {
+  switch (status) {
+    case SolveStatus::kOptimal:
+    case SolveStatus::kFeasible:
+    case SolveStatus::kUnbounded:
+    case SolveStatus::kIterationLimit:
+    case SolveStatus::kTimeLimit:
+    case SolveStatus::kNodeLimit:
+    case SolveStatus::kInterrupted: return true;
+    case SolveStatus::kNotSolved:
+    case SolveStatus::kInfeasible:
+    case SolveStatus::kInfeasibleOrUnbounded:
+    case SolveStatus::kNumericalError:
+    case SolveStatus::kModelError: return false;
+  }
+  return false;
+}
+
+/// Human-readable name for a status, for logs and the JSON result blob.
+[[nodiscard]] const char* to_string(SolveStatus status) noexcept;
+[[nodiscard]] const char* to_string(BasisStatus status) noexcept;
+[[nodiscard]] const char* to_string(VarType type) noexcept;
+
+// =========================================================================================
+// Model
+// =========================================================================================
+
+/// A linear, mixed-integer or convex quadratic optimization model.
+///
+///     optimize   objective_offset + c.x + 0.5 x^T Q x
+///     subject to row_lower <= A x <= row_upper
+///                col_lower <=  x  <= col_upper
+///                x_j integral for every j with col_type[j] == kInteger
+class Model {
+ public:
+  // ---- Identification -----------------------------------------------------------------
+
+  /// Problem name from the source file. Free-form, used only in logs and reports.
+  std::string name;
+
+  /// Path the model was read from, when it came from a file. Empty for models built
+  /// programmatically through the C API.
+  std::string source_path;
+
+  // ---- Objective ----------------------------------------------------------------------
+
+  ObjSense sense = ObjSense::kMinimize;
+
+  /// Constant term. MPS carries this as an RHS entry on the objective row, whose sign
+  /// convention is NEGATED relative to the objective constant - the reader is responsible
+  /// for that flip so that everything downstream can simply add this value.
+  double objective_offset = 0.0;
+
+  /// Linear objective coefficients, one per column.
+  std::vector<double> col_cost;
+
+  /// Lower triangle (including diagonal) of the symmetric Hessian Q, num_cols x num_cols.
+  /// Empty for an LP or MILP. See the file header for the 0.5 factor convention.
+  SparseMatrix hessian;
+
+  // ---- Columns ------------------------------------------------------------------------
+
+  /// Bounds, one entry per column. Use -kInfinity / +kInfinity for absent bounds.
+  std::vector<double> col_lower;
+  std::vector<double> col_upper;
+  std::vector<VarType> col_type;
+
+  /// Column names. Either empty (names not retained) or exactly num_cols long. Solution
+  /// files and the verifier match on these, so a reader that has names must keep them.
+  std::vector<std::string> col_names;
+
+  // ---- Rows ---------------------------------------------------------------------------
+
+  std::vector<double> row_lower;
+  std::vector<double> row_upper;
+  std::vector<std::string> row_names;
+
+  /// Constraint matrix, num_rows x num_cols, column-compressed. Must be frozen before any
+  /// engine sees it; validate() enforces that.
+  SparseMatrix matrix;
+
+  // ---- Derived queries ----------------------------------------------------------------
+
+  [[nodiscard]] Index num_cols() const noexcept { return static_cast<Index>(col_cost.size()); }
+  [[nodiscard]] Index num_rows() const noexcept { return static_cast<Index>(row_lower.size()); }
+  [[nodiscard]] Index num_nonzeros() const noexcept { return matrix.num_nonzeros(); }
+
+  /// True when any column is integral - i.e. this is a MILP or MIQP.
+  [[nodiscard]] bool has_integrality() const noexcept;
+
+  /// Number of integral columns.
+  [[nodiscard]] Index num_integer_columns() const noexcept;
+
+  /// True when the Hessian holds any entry - i.e. this is a QP or MIQP.
+  [[nodiscard]] bool has_quadratic_objective() const noexcept;
+
+  /// True when column j is fixed (lower == upper).
+  [[nodiscard]] bool is_fixed_column(Index j) const noexcept;
+
+  /// True when row i is an equality.
+  [[nodiscard]] bool is_equality_row(Index i) const noexcept;
+
+  /// The sign multiplier that converts the stored objective into a minimization objective.
+  /// +1 for kMinimize, -1 for kMaximize. Engines minimize internally and use this to
+  /// report the objective in the sense of the original file.
+  [[nodiscard]] double sense_multiplier() const noexcept {
+    return sense == ObjSense::kMaximize ? -1.0 : 1.0;
+  }
+
+  // ---- Construction helpers -----------------------------------------------------------
+
+  /// Resize every per-column array to `n`, filling new columns with cost 0, bounds
+  /// [0, +inf) - the MPS default - and kContinuous.
+  void resize_columns(Index n);
+
+  /// Resize every per-row array to `m`, filling new rows with a free range.
+  void resize_rows(Index m);
+
+  /// Evaluate the objective at `x` in the sense of the original file, including the
+  /// offset and the quadratic term. `x` must have num_cols entries.
+  [[nodiscard]] double evaluate_objective(const double* x) const;
+
+  /// Structural self-check. Returns an empty string when the model is well formed, or a
+  /// one-line description of the first problem found. Every reader calls this before
+  /// handing a model to an engine: a malformed model produces a plausible-looking wrong
+  /// answer rather than a crash, which is exactly the failure mode docs/CONTRIBUTING.md warns about.
+  [[nodiscard]] std::string validate() const;
+};
+
+// =========================================================================================
+// Solution
+// =========================================================================================
+
+/// The result of a solve. Vectors are either empty (the engine produced nothing of that
+/// kind) or exactly the right length; a consumer must check.
+class Solution {
+ public:
+  SolveStatus status = SolveStatus::kNotSolved;
+
+  /// Objective value at col_value, in the sense of the original model. Meaningless unless
+  /// status is kOptimal or kFeasible.
+  double objective = 0.0;
+
+  /// Best proven bound on the objective. For an LP this equals `objective` at optimality.
+  /// For a MIP it is the global dual bound over the open tree.
+  double dual_bound = 0.0;
+
+  /// Primal values, num_cols entries.
+  std::vector<double> col_value;
+
+  /// Row activities A x, num_rows entries. Recomputed rather than accumulated, so that it
+  /// is an independent check on the primal values rather than a restatement of them.
+  std::vector<double> row_activity;
+
+  /// Dual multipliers on the rows, num_rows entries. Sign convention: for a minimization
+  /// problem, y_i >= 0 on an active lower bound (a_i.x = row_lower[i]) and y_i <= 0 on an
+  /// active upper bound. These are the shadow prices the case studies report in rupees.
+  std::vector<double> row_dual;
+
+  /// Reduced costs on the columns, num_cols entries: d = c - A^T y (plus Q x for a QP).
+  std::vector<double> col_dual;
+
+  /// Basis, when the engine produces one. Empty for first-order methods.
+  std::vector<BasisStatus> col_status;
+  std::vector<BasisStatus> row_status;
+
+  // ---- Certificates for the two verdicts that have no point (#191) ---------------------
+  //
+  // These are an ADDITION to this frozen interface, made deliberately and called out here
+  // rather than slipped in: every existing consumer ignores them, and both default to empty,
+  // which is this class's established way of saying "the engine produced nothing of that
+  // kind". See include/nirnay/certificate.hpp for what they mean and how they are checked.
+
+  /// Farkas multipliers, one per row, when `status` is kInfeasible and the engine could
+  /// prove it. Aggregating the rows with these weights yields an inequality no point in the
+  /// column box satisfies. Empty when no proof was produced - presolve concludes
+  /// infeasibility from bound arithmetic and carries its reason in `message` instead.
+  std::vector<double> farkas_dual;
+
+  /// A ray, one entry per column, when `status` is kUnbounded: a direction no bound blocks
+  /// along which the objective improves without limit. Read together with `col_value`, which
+  /// carries the feasible point it starts from.
+  std::vector<double> primal_ray;
+
+  // ---- Reported quality. Never assumed - always measured before reporting. -------------
+
+  double primal_infeasibility = 0.0;  ///< max violation over row and column bounds
+
+  /// The same violations, each divided by the numerical scale of the quantity it was
+  /// measured on (#34).
+  ///
+  /// WHY BOTH EXIST. `primal_infeasibility` is an absolute number, and an absolute number is
+  /// the wrong question on a badly scaled model. Netlib `grow7` is the case that forced this:
+  /// its largest solution value is 4.8e+07, so the 1e-7 absolute tolerance is 2.1e-15
+  /// RELATIVE - below what double precision can deliver after 297 iterations of arithmetic.
+  /// Its worst violation, 2.0e-07, is 4.2e-15 relative, about nineteen machine epsilons. The
+  /// point is as accurate as doubles allow and was being reported as a numerical failure.
+  ///
+  /// The scale is the ROW'S OWN TERM MAGNITUDE, max |a_ij * x_j|, not the row's bound. The
+  /// row that fails on grow7 is an equality to ZERO, so dividing by the bound would change
+  /// nothing; what makes its residual large is cancellation between terms of magnitude 1e+07,
+  /// and the achievable accuracy of a sum is set by the size of what is being summed. For a
+  /// column bound the scale is |x_j| for the same reason.
+  ///
+  /// The absolute figure is still what gets REPORTED, because it is the one a reader can
+  /// check by hand against the model. This is what the status decision uses.
+  double primal_infeasibility_scaled = 0.0;
+
+  /// The dual violations, each divided by the numerical scale of the quantity it was
+  /// measured on - the dual counterpart of primal_infeasibility_scaled, and needed for the
+  /// same model: grow7's dual infeasibility is 6.1 absolute against costs and prices of
+  /// order 1e+07, which is 6e-07 relative, i.e. a point at the precision floor being called
+  /// a failed optimality claim.
+  ///
+  /// A COLUMN'S scale is the larger of its cost and the largest term of A^T y in that
+  /// column: the reduced cost d_j = c_j - a_j^T y is a difference of those quantities, and
+  /// when they are large and nearly equal the leading digits cancel, so the achievable
+  /// accuracy of d_j is set by their size, exactly as a row activity's is by its terms.
+  ///
+  /// A ROW'S scale is the infinity norm of the whole dual vector. A row price has no terms
+  /// of its own to compare against - its sign condition is the condition - so the only
+  /// honest scale is the size of the prices it sits among. That is a weaker test than the
+  /// column one and is stated as such: it says "this price is small relative to its
+  /// neighbours", not "this price is right".
+  ///
+  /// A COMPLEMENTARITY PRODUCT |multiplier| * slack is divided by the multiplier's scale
+  /// (as above) times the primal quantity's (as for primal_infeasibility_scaled): it is a
+  /// product of two measured numbers and inherits the precision of both. A reduced cost
+  /// that is a rounding residue of its terms, on a column that is interior by hundreds,
+  /// is a product of order 1e-7 and a violation of nothing.
+  double dual_infeasibility_scaled = 0.0;
+  double dual_infeasibility = 0.0;  ///< max violation of the reduced-cost sign conditions
+  double complementarity_violation = 0.0;
+  double integrality_violation = 0.0;
+
+  /// Iterative refinement of the final basis (#72; Wilkinson, "Rounding Errors in Algebraic
+  /// Processes", 1963). Steps taken, and the largest residual of the basic system - the
+  /// primal B x_B = -N x_N and the dual B^T y = c_B, whichever is worse - before the first
+  /// step and after the last. Zero steps when the engine produces no basis. Reported so a
+  /// point that only meets tolerance after refinement is visible as such rather than hidden.
+  Count refinement_steps = 0;
+  double residual_before_refinement = 0.0;
+  double residual_after_refinement = 0.0;
+
+  /// (objective - dual_bound) in absolute and relative terms. Zero for a solved LP.
+  double absolute_gap = 0.0;
+  double relative_gap = 0.0;
+
+  // ---- Effort -------------------------------------------------------------------------
+
+  Count iterations = 0;  ///< simplex/IPM/PDHG iterations
+  Count nodes = 0;       ///< branch-and-cut nodes
+  Count cuts_applied = 0;
+  /// Of `iterations`, those spent by the interior-point polish of a PDHG answer (#229);
+  /// zero when no polish ran. A benchmark row can then say which phase did what.
+  Count polish_iterations = 0;
+  /// Of `iterations`, the dual-simplex pivots crossover spent turning a first-order or
+  /// interior-point answer into an optimal basis; zero when no crossover ran. An ADDITION to
+  /// this frozen interface, made deliberately and called out here: it defaults to zero, and
+  /// every existing consumer that ignores it reads exactly what it read before.
+  Count crossover_iterations = 0;
+  double solve_seconds = 0.0;
+
+  /// Which engine produced this: "simplex-primal", "pdhg-cpu", "branch-and-cut", ...
+  std::string algorithm;
+
+  /// Free-form detail, especially for kNumericalError and kModelError.
+  std::string message;
+
+  /// True when the status indicates a usable primal point.
+  [[nodiscard]] bool has_primal_values() const noexcept {
+    return status == SolveStatus::kOptimal || status == SolveStatus::kFeasible;
+  }
+
+  /// Allocate every vector to match `model`, filled with zeros / kUnknown.
+  void allocate_for(const Model& model);
+
+  /// Recompute row_activity, every infeasibility measure and the gaps from col_value and
+  /// row_dual. Engines call this immediately before returning, so that the quality numbers
+  /// in the log are measured facts rather than the engine's own opinion of itself.
+  void recompute_quality(const Model& model);
+};
+
+// =========================================================================================
+// The single entry point
+// =========================================================================================
+
+/// Solve `model` under `options` and return a Solution.
+///
+/// This is the seam. The dispatcher picks an engine from the model class (LP / MILP / QP /
+/// MIQP) and the "algorithm" option, and future engines are added here and nowhere else.
+/// It never throws: every failure, including a malformed model, comes back as a status.
+///
+/// `control`, ADDED for #223: an optional progress callback and cooperative-interruption
+/// handle. May be null (the default), meaning no callback and no way to interrupt other
+/// than the existing time/iteration/node limits - every call site that predates #223 keeps
+/// compiling and behaving exactly as before. When non-null it is honoured everywhere a time
+/// limit already is: the simplex loops, the interior point, PDHG, the QP loop and the
+/// branch-and-bound tree, down to the factorization deadline itself (SparseLdl::ShouldStop,
+/// #197) they all already share.
+///
+/// `control` is a channel, not a read-only setting - like `Logger&` elsewhere in this
+/// signature list, engines write into it (progress) as well as reading from it (whether to
+/// stop), so it is a plain non-const pointer rather than `const SolveControl*`.
+[[nodiscard]] Solution solve(const Model& model, const Options& options,
+                             SolveControl* control = nullptr);
+
+}  // namespace nirnay

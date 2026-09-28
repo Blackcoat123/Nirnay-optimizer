@@ -1,0 +1,48 @@
+build/
+build-*/
+.cache/
+*.o
+# data/netlib/ is deliberately NOT ignored. The eight benchmark instances are about
+# 100 KB of text in total, and committing them means a fresh clone can run the whole
+# benchmark and the demo with no network - including the part that matters most, where
+# a judge picks the instance. Provenance is unaffected: every CSV row records the
+# instance sha256 and reference.json records the upstream readme hash.
+data/miplib/
+data/qplib/
+__pycache__/
+.venv/
+compile_commands.json
+.vscode/
+# Written by the HiGHS command-line binary, which bench/runners/compare.py shells out to
+# for the reference comparison. It is an artifact OF a third-party solver run, not of our
+# build - nothing in NIRNAY produces or reads it, and no HiGHS code is linked or vendored.
+# Ignored so a comparison run does not leave a file in the repo root that looks, at a
+# glance, like HiGHS is part of this project. See docs/PROVENANCE.md.
+Highs.log
+# Issue #18: bench/runners/generate_large_lp.py output. Regenerate with a fixed --seed
+# rather than committing - a 10k x 10k instance is tens of MB for something fully
+# reproducible from the generator and a seed recorded in the file's own header comment.
+bench/large/
+
+# Mittelmann LP instances are fetched by bench/runners/fetch_mittelmann.py; the manifest
+# (reference.json) is committed, the archives and the decompressed MPS files are not.
+data/mittelmann/*.bz2
+data/mittelmann/*.mps
+data/mittelmann/*.part
+data/mittelmann/*.packed
+
+# The full Netlib set (89 instances, ~40 MB) is fetched by bench/runners/fetch_data.py.
+# The nine committed instances stay tracked - an ignore rule never untracks a tracked
+# file - and every other decoded instance, plus the emps decoder the fetcher compiles,
+# stays out of the repository.
+data/netlib/*.mps
+data/netlib/emps
+data/netlib/emps.c
+data/netlib/*.packed
+
+# Maros-Meszaros convex QP set, fetched by bench/runners/fetch_maros_meszaros.py.
+data/maros/*.SIF
+data/maros/*.QPS
+data/maros/*.qps
+data/maros/*.zip
+data/maros/00README.QP

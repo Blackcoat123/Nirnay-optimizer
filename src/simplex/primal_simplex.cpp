@@ -1,0 +1,2052 @@
+// SPDX-License-Identifier: Apache-2.0
+// NIRNAY - bounded-variable revised primal simplex.
+//
+// References
+//   Dantzig, "Linear Programming and Extensions" (Princeton, 1963) - the method.
+//   Chvatal, "Linear Programming" (Freeman, 1983), ch. 3 and 8 - the bounded-variable form
+//     and Bland's anti-cycling rule.
+//   Maros, "Computational Techniques of the Simplex Method" (Kluwer, 2003), ch. 9 - the
+//     piecewise-linear (composite) phase 1 used below, and the long-step ratio test.
+//   Harris, P.M.J. (1973), "Pivot selection methods of the Devex LP code", Mathematical
+//     Programming 5, 1-28 - the two-pass ratio test (issue #67): pass one finds how far a
+//     relaxed set of bounds would allow the step to go, pass two takes the largest available
+//     pivot among rows that still block within that relaxed limit, trading a controlled,
+//     bounded amount of infeasibility for a far better-conditioned basis.
+//
+// FORMULATION. Every row gets a logical variable, so the working system is
+//
+//     [ A | -I ] [ x ; s ] = 0,     row_lower <= s <= row_upper,
+//                                   col_lower <= x <= col_upper
+//
+// with n structural variables indexed [0, n) and m logical variables indexed [n, n + m).
+// A basis is m of those columns. The all-logical basis B = -I is available for free, is
+// always nonsingular, and is where every solve starts.
+//
+// WHY NO BIG-M. The obvious phase 1 adds an artificial variable per row with a large cost
+// M. It is easy to write and it is a numerical trap: M has to dominate the real objective
+// to force feasibility first, so the cost vector spans M and the original coefficients at
+// once, which is precisely how you manufacture an ill-conditioned pricing step. Too small
+// an M silently returns an infeasible point as optimal. There is no value of M that is
+// right for every model, and the problem statement specifically asks about ill-conditioned
+// instances.
+//
+// Instead phase 1 minimises the piecewise-linear sum of bound violations of the basic
+// variables directly. The starting basis is the slack basis, no artificial columns are
+// introduced at all, and the phase-1 gradient is exactly -1 / 0 / +1 per basic variable.
+// It is bounded below by zero by construction, so "phase 1 stalls with no improving
+// column" is a proof of infeasibility rather than an inconclusive result.
+//
+// SCOPE. Devex pricing (default) with Dantzig behind an option and a Bland fallback, the
+// Harris two-pass ratio test with long-step bound flipping (opt-in, issue #67, below),
+// bound perturbation on a degenerate stall (#136; the dual loop's cost perturbation is its
+// analogue), and a sparse Markowitz LU updated in product form, refactorized when an FTRAN
+// residual check says the factors have drifted (#50). The full dense refactorization this
+// file started with survives as DenseLu, the oracle the sparse LU is tested against.
+
+#include "primal_simplex.hpp"
+#include "simplex_core.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <iterator>
+#include <limits>
+#include <string>
+#include <vector>
+
+#include <fmt/format.h>
+
+#include "nirnay/timer.hpp"
+#include "nirnay/tolerances.hpp"
+
+#include "../la/lu.hpp"
+#include "../la/scaling.hpp"
+
+namespace nirnay {
+
+namespace detail {
+
+// -----------------------------------------------------------------------------------------
+// Set-up
+// -----------------------------------------------------------------------------------------
+
+void Simplex::build_working_problem() {
+  n_ = model_.num_cols();
+  m_ = model_.num_rows();
+  total_ = n_ + m_;
+
+  const double sense = model_.sense_multiplier();
+  lower_.resize(static_cast<std::size_t>(total_));
+  upper_.resize(static_cast<std::size_t>(total_));
+  cost_.assign(static_cast<std::size_t>(total_), 0.0);
+
+  for (Index j = 0; j < n_; ++j) {
+    const auto u = static_cast<std::size_t>(j);
+    lower_[u] = model_.col_lower[u];
+    upper_[u] = model_.col_upper[u];
+    cost_[u] = sense * model_.col_cost[u];
+  }
+  for (Index i = 0; i < m_; ++i) {
+    const auto u = static_cast<std::size_t>(n_ + i);
+    const auto r = static_cast<std::size_t>(i);
+    lower_[u] = model_.row_lower[r];
+    upper_[u] = model_.row_upper[r];
+  }
+
+  x_basic_.assign(static_cast<std::size_t>(m_), 0.0);
+  cost_basic_.assign(static_cast<std::size_t>(m_), 0.0);
+  y_.assign(static_cast<std::size_t>(m_), 0.0);
+  alpha_.assign(static_cast<std::size_t>(m_), 0.0);
+  reduced_cost_.assign(static_cast<std::size_t>(total_), 0.0);
+  devex_weight_.assign(static_cast<std::size_t>(total_), 1.0);
+  rho_.assign(static_cast<std::size_t>(m_), 0.0);
+}
+
+void Simplex::set_initial_basis() {
+  basis_.resize(static_cast<std::size_t>(m_));
+  basis_position_.assign(static_cast<std::size_t>(total_), -1);
+  status_.assign(static_cast<std::size_t>(total_), BasisStatus::kUnknown);
+  nonbasic_value_.assign(static_cast<std::size_t>(total_), 0.0);
+
+  for (Index i = 0; i < m_; ++i) {
+    const Index logical = n_ + i;
+    basis_[static_cast<std::size_t>(i)] = logical;
+    basis_position_[static_cast<std::size_t>(logical)] = i;
+    status_[static_cast<std::size_t>(logical)] = BasisStatus::kBasic;
+  }
+
+  for (Index j = 0; j < n_; ++j) {
+    const auto u = static_cast<std::size_t>(j);
+    const double lo = lower_[u];
+    const double hi = upper_[u];
+    if (lo == hi) {
+      status_[u] = BasisStatus::kFixed;
+      nonbasic_value_[u] = lo;
+    } else if (is_finite_bound(lo)) {
+      status_[u] = BasisStatus::kAtLower;
+      nonbasic_value_[u] = lo;
+    } else if (is_finite_bound(hi)) {
+      status_[u] = BasisStatus::kAtUpper;
+      nonbasic_value_[u] = hi;
+    } else {
+      status_[u] = BasisStatus::kNonbasicFree;
+      nonbasic_value_[u] = 0.0;
+    }
+  }
+}
+
+void Simplex::make_nonbasic(Index k, double current) {
+  const auto u = static_cast<std::size_t>(k);
+  const double lo = lower_[u];
+  const double hi = upper_[u];
+  if (lo == hi) {
+    status_[u] = BasisStatus::kFixed;
+    nonbasic_value_[u] = lo;
+  } else if (is_finite_bound(lo) && is_finite_bound(hi)) {
+    // Both bounds finite: keep whichever the variable is already nearer, so a repair moves
+    // the point as little as it can. The alternative - always the lower bound - can throw a
+    // variable sitting at its upper bound the whole width of its range, and phase 1 then has
+    // to walk it back.
+    if (std::fabs(current - hi) < std::fabs(current - lo)) {
+      status_[u] = BasisStatus::kAtUpper;
+      nonbasic_value_[u] = hi;
+    } else {
+      status_[u] = BasisStatus::kAtLower;
+      nonbasic_value_[u] = lo;
+    }
+  } else if (is_finite_bound(lo)) {
+    status_[u] = BasisStatus::kAtLower;
+    nonbasic_value_[u] = lo;
+  } else if (is_finite_bound(hi)) {
+    status_[u] = BasisStatus::kAtUpper;
+    nonbasic_value_[u] = hi;
+  } else {
+    status_[u] = BasisStatus::kNonbasicFree;
+    nonbasic_value_[u] = 0.0;
+  }
+}
+
+bool Simplex::repair_basis() {
+  // BASIS REPAIR (#34), the standard remedy for a singular basis and the one thing this
+  // solver did not do about it. Reference: Maros, "Computational Techniques of the Simplex
+  // Method", section 9.4; Suhl & Suhl, "Computing sparse LU factorizations for large-scale
+  // linear programming bases", ORSA J. Computing 2 (1990), which describes the same patch.
+  //
+  // WHY THIS IS THE FIX RATHER THAN BETTER PIVOTING. refactorize() already retries the
+  // ordering all the way to full partial pivoting (tau = 1), so by the time it gives up the
+  // basis is not badly ordered, it is RANK DEFICIENT: some of its columns are linear
+  // combinations of the others, and no pivot order can make a singular matrix invertible.
+  // Measured on the full Netlib set, 13 of the 24 failures ended exactly here, including the
+  // whole pilot family - the largest single cause of failure in the benchmark.
+  //
+  // THE PATCH. If k columns are dependent, exactly k rows were left uncovered by the
+  // elimination. Evict those k columns and put in the LOGICAL (slack) of each uncovered row.
+  // A logical is the unit column e_i, so it pivots on row i against nothing else: the
+  // repaired basis is nonsingular by construction, not by luck, and re-factorizing it
+  // succeeds for a structural reason rather than a numerical one.
+  //
+  // WHAT IT COSTS, stated because it is not free. The evicted variables are parked on a
+  // bound, which moves the current point, so the basis afterwards may be primal infeasible
+  // where it was feasible before. That is recoverable - phase 1 exists for exactly this - and
+  // it is unambiguously better than the alternative, which was to return kNumericalError and
+  // no answer at all. It is a REPAIR, not a free lunch, and the counters report how often it
+  // fired so a run that limps to an answer cannot be mistaken for one that never stumbled.
+  // TWO GUARDS, AND THEY ASK DIFFERENT QUESTIONS. The stall guard asks whether the repair is
+  // rescuing this solve or looping on it: a repair moves the point, so the next iteration
+  // should be able to pivot, and repairs that keep arriving at the same iteration are not
+  // getting anywhere. The count is a backstop for a pathology neither guard anticipated.
+  if (has_repaired_ && iterations_seen_ > last_repair_iteration_) stalled_repairs_ = 0;
+  if (stalled_repairs_ >= kMaxStalledBasisRepairs) {
+    logger_.warning(
+        "basis singular again at iteration {} with no progress since the last {} repair(s); "
+        "not repairing",
+        iterations_seen_, stalled_repairs_);
+    return false;
+  }
+  if (repairs_ >= kMaxBasisRepairs) {
+    logger_.warning("basis singular again at iteration {} after {} repair(s); not repairing",
+                    iterations_seen_, repairs_);
+    return false;
+  }
+
+  const std::vector<Index> dependent = lu_.dependent_positions();
+  const std::vector<Index> uncovered = lu_.uncovered_rows();
+  if (dependent.empty() || dependent.size() != uncovered.size()) return false;
+
+  // SIZE GUARD, and the reason for it is the whole difficulty of this repair.
+  //
+  // eliminate() stops at the FIRST step with no acceptable pivot, so the columns it has not
+  // reached are not all dependent - they are simply unvisited. Treating them as dependent
+  // evicts most of the basis: measured on pilot4, the first repair wanted to replace 217 of
+  // 410 columns, and a basis that factorized a few iterations earlier has not lost half its
+  // rank. Repairing that many columns discards the point entirely and the solve stops
+  // converging - it ran 202 repairs without terminating.
+  //
+  // A genuine rank defect in a simplex basis is one or two columns. So the repair applies
+  // only when the reported defect is small enough to be credible, and otherwise declines and
+  // lets the caller report the singular basis exactly as it did before. Declining is not a
+  // silent no-op: the size is logged, because it is the measurement that says whether the
+  // narrow repair is worth having at all.
+  const std::size_t limit = std::max<std::size_t>(4, static_cast<std::size_t>(m_) / 20);
+  if (dependent.size() > limit) {
+    logger_.warning(
+        "singular basis at iteration {} reports {} unpivoted column(s) of {}, beyond the {} "
+        "the narrow repair trusts; not repairing",
+        iterations_seen_, dependent.size(), m_, limit);
+    return false;
+  }
+
+  std::size_t patched = 0;
+  for (std::size_t t = 0; t < dependent.size(); ++t) {
+    const Index slot = dependent[t];
+    const Index row = uncovered[t];
+    const Index logical = n_ + row;
+    if (slot < 0 || slot >= m_ || row < 0 || row >= m_) continue;
+    // A logical already in the basis cannot be added a second time. This should not happen -
+    // a unit column always pivots on its own row, so its row cannot be uncovered - but the
+    // invariant is cheap to check and expensive to get wrong.
+    if (basis_position_[static_cast<std::size_t>(logical)] >= 0) continue;
+
+    const Index leaving = basis_[static_cast<std::size_t>(slot)];
+    // Read the departing variable's value BEFORE the slot is cleared - it is the only hint
+    // available for which bound to park it on, and x_basic_ is indexed by slot, not variable.
+    const double leaving_value = (static_cast<std::size_t>(slot) < x_basic_.size())
+                                     ? x_basic_[static_cast<std::size_t>(slot)]
+                                     : lower_[static_cast<std::size_t>(leaving)];
+    basis_position_[static_cast<std::size_t>(leaving)] = -1;
+    make_nonbasic(leaving, leaving_value);
+
+    basis_[static_cast<std::size_t>(slot)] = logical;
+    basis_position_[static_cast<std::size_t>(logical)] = slot;
+    status_[static_cast<std::size_t>(logical)] = BasisStatus::kBasic;
+    ++patched;
+  }
+
+  if (patched == 0) return false;
+  repaired_columns_ += static_cast<Count>(patched);
+  ++repairs_;
+  if (has_repaired_ && iterations_seen_ == last_repair_iteration_) {
+    ++stalled_repairs_;
+  } else {
+    stalled_repairs_ = 1;
+  }
+  last_repair_iteration_ = iterations_seen_;
+  has_repaired_ = true;
+  // Logged HERE, where the count for this repair is in scope. Reporting the running total
+  // instead reads as one enormous repair rather than several small ones - which is exactly
+  // how the first version of this was misread while it was being debugged.
+  logger_.warning(
+      "basis singular at iteration {}: replaced {} dependent column(s) with "
+      "logicals (repair {} of at most {})",
+      iterations_seen_, patched, repairs_, kMaxBasisRepairs);
+  return true;
+}
+
+std::vector<double> Simplex::unbounded_ray(Index entering, int direction) const {
+  std::vector<double> ray(static_cast<std::size_t>(n_), 0.0);
+  const auto place = [&](Index k, double step) {
+    // Only structural columns are part of the model's ray; a logical column is the row's own
+    // activity, which follows from the structural moves rather than being chosen.
+    if (k < n_) ray[static_cast<std::size_t>(k)] = step;
+  };
+  place(entering, static_cast<double>(direction));
+  for (Index slot = 0; slot < m_; ++slot) {
+    place(basis_[static_cast<std::size_t>(slot)],
+          -static_cast<double>(direction) * alpha_[static_cast<std::size_t>(slot)]);
+  }
+  return ray;
+}
+
+double Simplex::unbounded_ray_residual(Index entering, int direction) const {
+  // THE CERTIFICATE BEHIND AN UNBOUNDED CLAIM. The ratio test found no blocking variable,
+  // which means the direction d - entering variable moving by `direction`, every basic
+  // variable moving by -direction * alpha - can be followed forever. That is only true if d
+  // is a ray of the feasible region, i.e. [A | -I] d = 0. alpha was computed as B^-1 a_q and
+  // on an ill-conditioned basis it can be wrong in every entry at once; the ratio test has
+  // no way to know, but the residual of the ray does. It costs one pass over the basic
+  // columns, and it is the difference between "unbounded" and "I could not tell".
+  std::vector<double> residual(static_cast<std::size_t>(m_), 0.0);
+  double scale = 0.0;
+  const auto accumulate = [&](Index k, double step) {
+    if (step == 0.0) return;
+    for_each_entry(k, [&](Index row, double coefficient) {
+      const double term = coefficient * step;
+      residual[static_cast<std::size_t>(row)] += term;
+      scale = std::max(scale, std::fabs(term));
+    });
+  };
+  accumulate(entering, static_cast<double>(direction));
+  for (Index slot = 0; slot < m_; ++slot) {
+    accumulate(basis_[static_cast<std::size_t>(slot)],
+               -static_cast<double>(direction) * alpha_[static_cast<std::size_t>(slot)]);
+  }
+  double worst = 0.0;
+  for (const double r : residual) worst = std::max(worst, std::fabs(r));
+  return worst / std::max(1.0, scale);
+}
+
+bool Simplex::refactorize() {
+  // Reset at entry rather than at the successful return, so every exit path - the ladder,
+  // a repair, a failure - leaves the counter consistent with whatever factors are in use.
+  eta_work_since_refactor_ = 0.0;
+  // Phase 2 materialised a dense m x m array here and threw it away again on every pivot:
+  // O(m^2) of memory traffic and O(m^3) of arithmetic to factorize a matrix that is better
+  // than 99% structural zeros at any realistic size. Nothing is materialised now. A
+  // structural column is handed to the factorization as a pointer into the model's own CSC
+  // storage, and a logical column is the single entry -1.
+  if (logical_rows_.empty() && m_ > 0) {
+    logical_rows_.resize(static_cast<std::size_t>(m_));
+    logical_values_.assign(static_cast<std::size_t>(m_), -1.0);
+    for (Index i = 0; i < m_; ++i) logical_rows_[static_cast<std::size_t>(i)] = i;
+  }
+
+  basis_columns_.assign(static_cast<std::size_t>(m_), LuColumn{});
+  for (Index slot = 0; slot < m_; ++slot) {
+    const Index k = basis_[static_cast<std::size_t>(slot)];
+    LuColumn& target = basis_columns_[static_cast<std::size_t>(slot)];
+    if (k < n_) {
+      const ColumnView column = model_.matrix.column(k);
+      target.rows = column.rows;
+      target.values = column.values;
+      target.size = column.size;
+    } else {
+      const auto row = static_cast<std::size_t>(k - n_);
+      target.rows = logical_rows_.data() + row;
+      target.values = logical_values_.data() + row;
+      target.size = 1;
+    }
+  }
+  // Markowitz trades stability for fill: at tau = 0.01 a pivot may be a hundred times
+  // smaller than the largest entry in its column, and on a badly scaled basis that choice
+  // can leave a later step with nothing above the pivot tolerance at all. The dense
+  // factorization never had this failure mode because partial pivoting always takes the
+  // largest entry, i.e. it is this same algorithm at tau = 1.
+  //
+  // Netlib `blend` is a real instance that fails at 0.01 and succeeds at a stricter
+  // threshold. So a failure is not reported as a singular basis until the ordering has been
+  // retried with progressively more stability, ending at full partial pivoting - more fill,
+  // slower, and still enormously better than a dense refactorization. Only a basis that is
+  // singular under partial pivoting is genuinely singular.
+  static constexpr double kThresholdLadder[] = {tol::kMarkowitzThreshold, 0.1, 0.5, 1.0};
+  for (std::size_t attempt = 0; attempt < std::size(kThresholdLadder); ++attempt) {
+    if (lu_.factorize(basis_columns_, m_, tol::kPivotTolerance, kThresholdLadder[attempt],
+                      deadline_)) {
+      // PER FACTORIZATION, NOT A LATCH. This used to latch true for the rest of the solve,
+      // which disabled the basis update permanently and made every later iteration
+      // refactorize from scratch: measured on modszk1, 109,827 refactorizations in 80
+      // seconds, ~1,400 iterations per second against ~6,000 with the update allowed. The
+      // latch was containment for a degenerate pivot-path divergence on d6cube "until"
+      // anti-degeneracy machinery existed; perturbation (#136) and the Harris ratio test
+      // (#137) now do. What the flag still legitimately means is "THIS basis is poorly
+      // conditioned, do not update on top of it" - a property of the factorization in hand,
+      // so each one sets it for itself.
+      basis_needed_stricter_threshold_ = attempt > 0;
+      if (attempt > 0 && !warned_about_threshold_) {
+        warned_about_threshold_ = true;
+        logger_.warning(
+            "basis factorization needed a Markowitz threshold of {:g} rather than {:g}; "
+            "the basis is poorly scaled and the factors will carry more fill",
+            kThresholdLadder[attempt], tol::kMarkowitzThreshold);
+      }
+      // BASIS CONDITIONING, RECORDED RATHER THAN INFERRED. The smallest pivot of a fresh
+      // factorization is the cheapest honest read on how close a basis is to singular. The
+      // factorization already computes it; nothing was asking for it.
+      //
+      // The refactorization count does not answer the same question. It confounds
+      // conditioning with FILL - a basis can be perfectly well conditioned and still trigger
+      // the eta-fill rule every other pivot - so a run that refactorizes constantly and one
+      // whose basis is decaying look identical from the outside, and they need opposite
+      // responses.
+      //
+      // Added because #66 could not be settled without it: devex drives grow22 and scsd8 to
+      // "basis became singular" while Dantzig does not, and the ratio test, accumulated
+      // update error and small committed pivots had each been eliminated by experiment.
+      // With this line the answer took one run - the smallest pivot falls to 6.1e-08 and
+      // 1.6e-09 under devex against 1.0e-03 and 4.0e-03 under Dantzig, so the basis really
+      // is decaying rather than failing suddenly.
+      const double pivot = lu_.smallest_pivot();
+      if (pivot > 0.0 && (worst_basis_pivot_ == 0.0 || pivot < worst_basis_pivot_)) {
+        worst_basis_pivot_ = pivot;
+      }
+      logger_.verbose("refactorized at iteration {}: smallest pivot {:.3e}", iterations_seen_,
+                      pivot);
+      return true;
+    }
+    // Told to stop, not unable to: the ladder and the repair below would only run the same
+    // clock out further on the same basis.
+    if (lu_.stopped_early()) {
+      factors_abandoned_ = true;
+      return false;
+    }
+  }
+
+  // The ladder ran out at full partial pivoting, so this basis is rank deficient rather than
+  // badly ordered. Patch it and factorize once more. ONE retry, not a loop: the repaired
+  // basis is nonsingular by construction, so a second failure means an assumption above is
+  // wrong, and spinning on it would turn a wrong answer into a hang.
+  if (repair_basis()) {
+    for (Index slot = 0; slot < m_; ++slot) {
+      const Index k = basis_[static_cast<std::size_t>(slot)];
+      LuColumn& target = basis_columns_[static_cast<std::size_t>(slot)];
+      if (k < n_) {
+        const ColumnView column = model_.matrix.column(k);
+        target.rows = column.rows;
+        target.values = column.values;
+        target.size = column.size;
+      } else {
+        const auto row = static_cast<std::size_t>(k - n_);
+        target.rows = logical_rows_.data() + row;
+        target.values = logical_values_.data() + row;
+        target.size = 1;
+      }
+    }
+    if (lu_.factorize(basis_columns_, m_, tol::kPivotTolerance, 1.0, deadline_)) {
+      basis_needed_stricter_threshold_ = true;
+      // THE BASIS CHANGED, SO THE BASIC VALUES DESCRIBE A BASIS THAT NO LONGER EXISTS.
+      //
+      // Every other caller of refactorize() rebuilds the same factorization of the same
+      // basis, so x_basic_ stays valid across it and only one of the two call sites bothers
+      // to recompute. A repair is the exception: it swaps columns, so x_basic_ must be
+      // recomputed here rather than left to the caller. Without this the ratio test at the
+      // accuracy-check site runs on values from the pre-repair basis, which is not a crash
+      // and not a warning - it is a plausible wrong number, the failure mode docs/CONTRIBUTING.md's
+      // evidence rules exist for.
+      compute_basic_values();
+      return true;
+    }
+    if (lu_.stopped_early()) factors_abandoned_ = true;
+  }
+  return false;
+}
+
+void Simplex::arm_deadline(const Timer& timer) {
+  factors_abandoned_ = false;
+  const bool time_limited = time_limit_ > 0.0 && std::isfinite(time_limit_);
+  // #223: the same deadline the time limit hands to the factorization also carries an
+  // external interrupt in, exactly the generalisation #197's own comment on this class
+  // describes - "the deadline inside the factorization" was already the seam.
+  if (time_limited || control_ != nullptr) {
+    deadline_ = [&timer, this, time_limited] {
+      if (control_ != nullptr && control_->is_interrupted()) return true;
+      return time_limited && timer.elapsed_seconds() > time_limit_;
+    };
+  } else {
+    deadline_ = {};
+  }
+}
+
+Solution Simplex::factorization_failed(Count iterations, const Timer& timer) {
+  if (factors_abandoned_) {
+    const bool interrupted = control_ != nullptr && control_->is_interrupted();
+    const std::string message =
+        interrupted
+            ? std::string("interrupted inside the basis factorization, which was abandoned")
+            : fmt::format(
+                  "time limit {:g}s reached inside the basis factorization, which "
+                  "was abandoned",
+                  time_limit_);
+    return finish(interrupted ? SolveStatus::kInterrupted : SolveStatus::kTimeLimit, message,
+                  iterations, timer.elapsed_seconds());
+  }
+  return finish(SolveStatus::kNumericalError,
+                fmt::format("basis became singular at iteration {}", iterations), iterations,
+                timer.elapsed_seconds());
+}
+
+void Simplex::perturb_bounds() {
+  if (perturbed_) return;
+  for (Index k = 0; k < total_; ++k) {
+    const auto u = static_cast<std::size_t>(k);
+    // A FIXED variable is left exactly alone. Widening lower == upper would turn a variable
+    // the model pins to one value into one with a range, which is a different problem rather
+    // than a nudged one.
+    if (lower_[u] == upper_[u]) continue;
+    const double shift = perturbation_for(k);
+    if (is_finite_bound(lower_[u])) lower_[u] -= shift;
+    if (is_finite_bound(upper_[u])) upper_[u] += shift;
+  }
+  perturbed_ = true;
+  ++perturbations_;
+}
+
+void Simplex::remove_perturbation() {
+  if (!perturbed_) return;
+  for (Index k = 0; k < n_; ++k) {
+    const auto u = static_cast<std::size_t>(k);
+    lower_[u] = model_.col_lower[u];
+    upper_[u] = model_.col_upper[u];
+  }
+  for (Index i = 0; i < m_; ++i) {
+    const auto u = static_cast<std::size_t>(n_ + i);
+    const auto r = static_cast<std::size_t>(i);
+    lower_[u] = model_.row_lower[r];
+    upper_[u] = model_.row_upper[r];
+  }
+  // A nonbasic variable was parked on a RELAXED bound and must be moved back onto the true
+  // one, or the basic values recomputed from it are wrong by the shift.
+  for (Index k = 0; k < total_; ++k) {
+    const auto u = static_cast<std::size_t>(k);
+    if (basis_position_[u] >= 0) continue;
+    if (status_[u] == BasisStatus::kAtLower && is_finite_bound(lower_[u])) {
+      nonbasic_value_[u] = lower_[u];
+    } else if (status_[u] == BasisStatus::kAtUpper && is_finite_bound(upper_[u])) {
+      nonbasic_value_[u] = upper_[u];
+    }
+  }
+  perturbed_ = false;
+  compute_basic_values();
+}
+
+namespace {
+
+/// Error-free product and sum (Dekker/Knuth as used by Ogita, Rump & Oishi): the returned
+/// pair (s, e) satisfies s + e == a * b exactly, and likewise for the sum.
+struct Compensated {
+  double sum = 0.0;
+  double error = 0.0;
+  void add(double value) {
+    const double s = sum + value;
+    const double bb = s - sum;
+    error += (sum - (s - bb)) + (value - bb);
+    sum = s;
+  }
+  void add_product(double a, double b) {
+    const double p = a * b;
+    const double e = std::fma(a, b, -p);
+    add(p);
+    error += e;
+  }
+  [[nodiscard]] double value() const { return sum + error; }
+};
+
+}  // namespace
+
+void Simplex::refine_final_basis() {
+  refinement_steps_ = 0;
+  residual_before_refinement_ = 0.0;
+  residual_after_refinement_ = 0.0;
+  if (m_ == 0) return;
+
+  // The primal residual r = -N x_N - B x_B, accumulated in compensated arithmetic over the
+  // whole of [A | -I] x: every column, basic or not, at its current value.
+  const auto primal_residual = [&](std::vector<double>* r) {
+    std::vector<Compensated> acc(static_cast<std::size_t>(m_));
+    for (Index k = 0; k < total_; ++k) {
+      const double value = variable_value(k);
+      if (value == 0.0) continue;
+      for_each_entry(k, [&](Index row, double coefficient) {
+        acc[static_cast<std::size_t>(row)].add_product(-coefficient, value);
+      });
+    }
+    double worst = 0.0;
+    for (Index i = 0; i < m_; ++i) {
+      (*r)[static_cast<std::size_t>(i)] = acc[static_cast<std::size_t>(i)].value();
+      worst = std::max(worst, std::fabs((*r)[static_cast<std::size_t>(i)]));
+    }
+    return worst;
+  };
+  // The dual residual s = c_B - B^T y over the basic columns.
+  const auto dual_residual = [&](std::vector<double>* s) {
+    double worst = 0.0;
+    for (Index slot = 0; slot < m_; ++slot) {
+      const Index k = basis_[static_cast<std::size_t>(slot)];
+      Compensated acc;
+      acc.add(cost_[static_cast<std::size_t>(k)]);
+      for_each_entry(k, [&](Index row, double coefficient) {
+        acc.add_product(-coefficient, y_[static_cast<std::size_t>(row)]);
+      });
+      (*s)[static_cast<std::size_t>(slot)] = acc.value();
+      worst = std::max(worst, std::fabs((*s)[static_cast<std::size_t>(slot)]));
+    }
+    return worst;
+  };
+
+  std::vector<double> r(static_cast<std::size_t>(m_));
+  std::vector<double> s(static_cast<std::size_t>(m_));
+  double primal_worst = primal_residual(&r);
+  double dual_worst = dual_residual(&s);
+  residual_before_refinement_ = std::max(primal_worst, dual_worst);
+  residual_after_refinement_ = residual_before_refinement_;
+
+  for (int step = 0; step < kMaxRefinementSteps; ++step) {
+    if (residual_after_refinement_ == 0.0) break;
+    // Corrections from the same factors: B dx = r, B^T dy = s.
+    lu_.solve(r.data());
+    lu_.solve_transpose(s.data());
+    std::vector<double> x_saved = x_basic_;
+    std::vector<double> y_saved = y_;
+    for (Index i = 0; i < m_; ++i) {
+      x_basic_[static_cast<std::size_t>(i)] += r[static_cast<std::size_t>(i)];
+      y_[static_cast<std::size_t>(i)] += s[static_cast<std::size_t>(i)];
+    }
+    primal_worst = primal_residual(&r);
+    dual_worst = dual_residual(&s);
+    const double now = std::max(primal_worst, dual_worst);
+    if (now >= residual_after_refinement_) {
+      // No improvement: the factors cannot say more than they already have. Keep the
+      // previous iterate, which was at least as good.
+      x_basic_ = std::move(x_saved);
+      y_ = std::move(y_saved);
+      break;
+    }
+    residual_after_refinement_ = now;
+    ++refinement_steps_;
+  }
+  if (refinement_steps_ > 0) {
+    // The reduced costs follow from y and are recomputed from it, phase-2 costs.
+    for (Index k = 0; k < total_; ++k) {
+      const auto u = static_cast<std::size_t>(k);
+      if (basis_position_[u] >= 0) {
+        reduced_cost_[u] = 0.0;
+        continue;
+      }
+      double dot = 0.0;
+      for_each_entry(k, [&](Index row, double coefficient) {
+        dot += y_[static_cast<std::size_t>(row)] * coefficient;
+      });
+      reduced_cost_[u] = cost_[u] - dot;
+    }
+    logger_.info(
+        "Refinement: {} step(s) on the final basis; largest basic-system residual {:.3e} "
+        "-> {:.3e}",
+        refinement_steps_, residual_before_refinement_, residual_after_refinement_);
+  } else {
+    logger_.verbose("Refinement: no step improved the final basis (residual {:.3e})",
+                    residual_before_refinement_);
+  }
+}
+
+void Simplex::compute_basic_values() {
+  if (factors_abandoned_) return;  // no factors to solve with (#208); x_ is as it was
+  // [A | -I][x ; s] = 0, so B x_B = -N x_N.
+  std::vector<double> rhs(static_cast<std::size_t>(m_), 0.0);
+  for (Index k = 0; k < total_; ++k) {
+    if (basis_position_[static_cast<std::size_t>(k)] >= 0) continue;
+    const double value = nonbasic_value_[static_cast<std::size_t>(k)];
+    if (value == 0.0) continue;
+    for_each_entry(k, [&](Index row, double coefficient) {
+      rhs[static_cast<std::size_t>(row)] -= coefficient * value;
+    });
+  }
+  lu_.solve(rhs.data());
+  x_basic_ = std::move(rhs);
+}
+
+// -----------------------------------------------------------------------------------------
+// Phase classification and pricing
+// -----------------------------------------------------------------------------------------
+
+Position Simplex::position_of(Index basic_slot) const {
+  const Index k = basis_[static_cast<std::size_t>(basic_slot)];
+  const double x = x_basic_[static_cast<std::size_t>(basic_slot)];
+  const double lo = lower_[static_cast<std::size_t>(k)];
+  const double hi = upper_[static_cast<std::size_t>(k)];
+  if (is_finite_bound(lo) && x < lo - primal_tolerance_) return Position::kBelowLower;
+  if (is_finite_bound(hi) && x > hi + primal_tolerance_) return Position::kAboveUpper;
+  return Position::kFeasible;
+}
+
+double Simplex::max_infeasibility() const {
+  double worst = 0.0;
+  for (Index slot = 0; slot < m_; ++slot) {
+    const Index k = basis_[static_cast<std::size_t>(slot)];
+    const double x = x_basic_[static_cast<std::size_t>(slot)];
+    const double lo = lower_[static_cast<std::size_t>(k)];
+    const double hi = upper_[static_cast<std::size_t>(k)];
+    if (is_finite_bound(lo) && x < lo) worst = std::max(worst, lo - x);
+    if (is_finite_bound(hi) && x > hi) worst = std::max(worst, x - hi);
+  }
+  return worst;
+}
+
+void Simplex::compute_reduced_costs(bool phase_one) {
+  if (factors_abandoned_) return;  // no factors to solve with (#208); d_ is as it was
+  if (phase_one) {
+    // Gradient of sum of bound violations with respect to each basic variable. Nonbasic
+    // variables sit exactly on a bound and contribute nothing, so their phase-1 cost is 0.
+    for (Index slot = 0; slot < m_; ++slot) {
+      switch (position_of(slot)) {
+        case Position::kBelowLower: cost_basic_[static_cast<std::size_t>(slot)] = -1.0; break;
+        case Position::kAboveUpper: cost_basic_[static_cast<std::size_t>(slot)] = 1.0; break;
+        case Position::kFeasible: cost_basic_[static_cast<std::size_t>(slot)] = 0.0; break;
+      }
+    }
+  } else {
+    for (Index slot = 0; slot < m_; ++slot) {
+      cost_basic_[static_cast<std::size_t>(slot)] =
+          cost_[static_cast<std::size_t>(basis_[static_cast<std::size_t>(slot)])];
+    }
+  }
+
+  y_ = cost_basic_;
+  lu_.solve_transpose(y_.data());
+
+  // One reduced cost per column, each written by one thread and read by none: a gather,
+  // deterministic at any thread count (#57).
+#ifdef NIRNAY_HAVE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+  for (Index k = 0; k < total_; ++k) {
+    if (basis_position_[static_cast<std::size_t>(k)] >= 0) {
+      reduced_cost_[static_cast<std::size_t>(k)] = 0.0;
+      continue;
+    }
+    double dot = 0.0;
+    for_each_entry(k, [&](Index row, double coefficient) {
+      dot += y_[static_cast<std::size_t>(row)] * coefficient;
+    });
+    const double own_cost = phase_one ? 0.0 : cost_[static_cast<std::size_t>(k)];
+    reduced_cost_[static_cast<std::size_t>(k)] = own_cost - dot;
+  }
+}
+
+Index Simplex::price(bool bland, int* direction) const {
+  Index best = -1;
+  // Seeded at zero, not at the dual tolerance: eligibility is now tested explicitly against
+  // dual_tolerance_ below, because in devex mode this variable holds d^2 / w and comparing
+  // that against a tolerance on |d| would be comparing two different quantities.
+  double best_score = 0.0;
+
+  for (Index k = 0; k < total_; ++k) {
+    const auto u = static_cast<std::size_t>(k);
+    if (basis_position_[u] >= 0) continue;
+    if (status_[u] == BasisStatus::kFixed) continue;
+
+    const double d = reduced_cost_[u];
+    int candidate_direction = 0;
+    if (status_[u] == BasisStatus::kAtLower) {
+      if (d < -dual_tolerance_) candidate_direction = 1;
+    } else if (status_[u] == BasisStatus::kAtUpper) {
+      if (d > dual_tolerance_) candidate_direction = -1;
+    } else {  // free, held at zero: either direction is available
+      if (d < -dual_tolerance_) {
+        candidate_direction = 1;
+      } else if (d > dual_tolerance_) {
+        candidate_direction = -1;
+      }
+    }
+    if (candidate_direction == 0) continue;
+
+    if (bland) {
+      // Bland's rule: the lowest index that prices out. Provably terminates, prices badly,
+      // which is why it is only reached after a run of degenerate iterations.
+      *direction = candidate_direction;
+      return k;
+    }
+    // Dantzig compares |d|; devex compares d^2 / w, which is |d| divided by an approximate
+    // edge norm. Both are scored against `best_magnitude`, seeded at the dual tolerance, so
+    // eligibility is decided by |d| in BOTH modes - the weight changes which eligible column
+    // wins, never whether a column is eligible at all. Mixing those two jobs would let a
+    // large weight silently suppress a column that genuinely prices out, which is a
+    // termination bug rather than a slow pivot.
+    const double magnitude = std::fabs(d);
+    if (magnitude <= dual_tolerance_) continue;
+    const double score = devex_ ? (magnitude * magnitude) / devex_weight_[u] : magnitude;
+    if (score > best_score) {
+      best_score = score;
+      best = k;
+      *direction = candidate_direction;
+    }
+  }
+  return best;
+}
+
+void Simplex::reset_devex() {
+  std::fill(devex_weight_.begin(), devex_weight_.end(), 1.0);
+  ++devex_resets_;
+}
+
+void Simplex::update_devex_weights(Index entering, Index leaving_row, double pivot) {
+  if (!devex_ || std::fabs(pivot) < tol::kZeroDrop) return;
+
+  const auto q = static_cast<std::size_t>(entering);
+  const double weight_q = devex_weight_[q];
+
+  // rho = B^-T e_r, so that rho . a_j gives alpha_rj, the entry of the leaving row under
+  // column j. One BTRAN, then one dot product per nonbasic column.
+  std::fill(rho_.begin(), rho_.end(), 0.0);
+  rho_[static_cast<std::size_t>(leaving_row)] = 1.0;
+  lu_.solve_transpose(rho_.data());
+
+  const double inverse_pivot = 1.0 / pivot;
+  const double scaled_weight_q = weight_q * inverse_pivot * inverse_pivot;
+
+  double largest = 1.0;
+  for (Index k = 0; k < total_; ++k) {
+    const auto u = static_cast<std::size_t>(k);
+    if (basis_position_[u] >= 0) continue;
+    if (k == entering) continue;
+
+    double alpha_rk = 0.0;
+    for_each_entry(k, [&](Index row, double coefficient) {
+      alpha_rk += rho_[static_cast<std::size_t>(row)] * coefficient;
+    });
+    if (alpha_rk == 0.0) continue;
+
+    // w_j <- max(w_j, (alpha_rj / alpha_rq)^2 * w_q). The weights only ever GROW inside a
+    // reference framework; that monotonicity is what makes the approximation safe to reuse
+    // across pivots, and it is also why the framework has to be reset once they blow up.
+    const double candidate = alpha_rk * alpha_rk * scaled_weight_q;
+    if (candidate > devex_weight_[u]) devex_weight_[u] = candidate;
+    if (devex_weight_[u] > largest) largest = devex_weight_[u];
+  }
+
+  // The variable that just left the basis becomes nonbasic and needs a weight of its own.
+  const double leaving_weight = std::max(scaled_weight_q, 1.0);
+  devex_weight_[static_cast<std::size_t>(basis_[static_cast<std::size_t>(leaving_row)])] =
+      leaving_weight;
+  if (leaving_weight > largest) largest = leaving_weight;
+
+  // A reference weight is an approximation to a steepest-edge norm measured from the
+  // framework the weights were last reset in. The further the basis travels from it the
+  // worse the approximation, and unbounded growth is the symptom. Restarting costs one
+  // sweep and buys back the accuracy; Forrest and Goldfarb restart on exactly this test.
+  if (largest > kDevexResetThreshold) reset_devex();
+}
+
+void Simplex::ftran_entering_column(Index entering) {
+  std::fill(alpha_.begin(), alpha_.end(), 0.0);
+  for_each_entry(entering, [&](Index row, double value) {
+    alpha_[static_cast<std::size_t>(row)] += value;
+  });
+  lu_.solve(alpha_.data());
+}
+
+double Simplex::ftran_residual(Index entering) const {
+  // B alpha, accumulated straight from the basis columns.
+  std::vector<double> product(static_cast<std::size_t>(m_), 0.0);
+  for (Index slot = 0; slot < m_; ++slot) {
+    const double weight = alpha_[static_cast<std::size_t>(slot)];
+    if (weight == 0.0) continue;
+    for_each_entry(basis_[static_cast<std::size_t>(slot)], [&](Index row, double value) {
+      product[static_cast<std::size_t>(row)] += value * weight;
+    });
+  }
+
+  // ... which must reproduce the entering column.
+  double worst = 0.0;
+  double scale = 1.0;
+  for_each_entry(entering, [&](Index row, double value) {
+    product[static_cast<std::size_t>(row)] -= value;
+    scale = std::max(scale, std::fabs(value));
+  });
+  for (Index i = 0; i < m_; ++i) {
+    worst = std::max(worst, std::fabs(product[static_cast<std::size_t>(i)]));
+  }
+  return worst / scale;
+}
+
+// -----------------------------------------------------------------------------------------
+// Ratio test
+// -----------------------------------------------------------------------------------------
+
+RatioResult Simplex::ratio_test(Index entering, int direction, bool phase_one) const {
+  return harris_ratio_test_ ? ratio_test_harris(entering, direction, phase_one)
+                            : ratio_test_textbook(entering, direction, phase_one);
+}
+
+RatioResult Simplex::ratio_test_textbook(Index entering, int direction, bool phase_one) const {
+  RatioResult result;
+  const double sign = static_cast<double>(direction);
+
+  // The entering variable's own range limits the step even when nothing blocks: moving from
+  // one finite bound to the other is a bound flip and leaves the basis untouched.
+  double best_step = std::numeric_limits<double>::infinity();
+  const auto e = static_cast<std::size_t>(entering);
+  if (is_finite_bound(lower_[e]) && is_finite_bound(upper_[e])) {
+    best_step = upper_[e] - lower_[e];
+  }
+  Index best_slot = -1;
+  bool best_to_upper = false;
+  double best_pivot_magnitude = 0.0;
+
+  for (Index slot = 0; slot < m_; ++slot) {
+    const double a = alpha_[static_cast<std::size_t>(slot)];
+    // rate = d(x_B[slot]) / dt as the entering variable moves in `direction`.
+    const double rate = -sign * a;
+    if (std::fabs(rate) <= tol::kPivotTolerance) continue;
+
+    const Index k = basis_[static_cast<std::size_t>(slot)];
+    const double x = x_basic_[static_cast<std::size_t>(slot)];
+    const double lo = lower_[static_cast<std::size_t>(k)];
+    const double hi = upper_[static_cast<std::size_t>(k)];
+
+    double step = std::numeric_limits<double>::infinity();
+    bool to_upper = false;
+
+    const Position position = phase_one ? position_of(slot) : Position::kFeasible;
+    switch (position) {
+      case Position::kBelowLower:
+        // Infeasible below its lower bound. Moving up, it becomes feasible exactly at the
+        // bound and we stop there. ratio_test_harris() below takes the fuller piecewise-
+        // linear step; this rule keeps the test a single comparison.
+        if (rate > 0.0 && is_finite_bound(lo)) step = (lo - x) / rate;
+        break;
+      case Position::kAboveUpper:
+        if (rate < 0.0 && is_finite_bound(hi)) {
+          step = (hi - x) / rate;
+          to_upper = true;
+        }
+        break;
+      case Position::kFeasible:
+        if (rate > 0.0 && is_finite_bound(hi)) {
+          step = (hi - x) / rate;
+          to_upper = true;
+        } else if (rate < 0.0 && is_finite_bound(lo)) {
+          step = (lo - x) / rate;
+        }
+        break;
+    }
+
+    if (!(step < std::numeric_limits<double>::infinity())) continue;
+    // A basic variable already a hair outside its bound would otherwise yield a small
+    // negative step and drive the iterate backwards.
+    if (step < 0.0) step = 0.0;
+
+    const double pivot_magnitude = std::fabs(a);
+    const bool strictly_shorter = step < best_step - tol::kRatioTestFeasibility;
+    const bool tied_but_stabler = std::fabs(step - best_step) <= tol::kRatioTestFeasibility &&
+                                  pivot_magnitude > best_pivot_magnitude;
+    if (strictly_shorter || tied_but_stabler) {
+      best_step = step;
+      best_slot = slot;
+      best_to_upper = to_upper;
+      best_pivot_magnitude = pivot_magnitude;
+    }
+  }
+
+  if (!(best_step < std::numeric_limits<double>::infinity())) {
+    result.unbounded = true;
+    return result;
+  }
+  result.step = best_step;
+  result.leaving_position = best_slot;
+  result.leaving_to_upper = best_to_upper;
+  return result;
+}
+
+RatioResult Simplex::ratio_test_harris(Index entering, int direction, bool phase_one) const {
+  RatioResult result;
+  const double sign = static_cast<double>(direction);
+
+  // The entering variable's own range limits the step even when nothing blocks: moving from
+  // one finite bound to the other is a bound flip and leaves the basis untouched. This is a
+  // structural limit on the ENTERING variable itself, not a blocking row, so it is never
+  // relaxed the way candidate rows are below.
+  double theta_max = std::numeric_limits<double>::infinity();
+  const auto e = static_cast<std::size_t>(entering);
+  if (is_finite_bound(lower_[e]) && is_finite_bound(upper_[e])) {
+    theta_max = upper_[e] - lower_[e];
+  }
+
+  // PASS ONE (Harris 1973). For every row that blocks, compute the step a bound RELAXED by
+  // kHarrisRelaxation would allow, and take the smallest such step as theta_max. Any step at
+  // or below theta_max is safe to consider in pass two: it introduces at most
+  // kHarrisRelaxation of new infeasibility on whichever row actually defines theta_max, which
+  // tolerances.hpp establishes is inside kPrimalFeasibility.
+  //
+  // LONG-STEP BOUND FLIPPING (issue #67, generalising the piecewise-linear phase-1 objective
+  // this file already cites Maros ch. 9 for). A basic variable that starts phase 1 outside
+  // its bounds and is moving TOWARD feasibility never needs to stop the search when it
+  // crosses into feasibility - the phase-1 slope only improves there, it does not reverse.
+  //
+  // Crossing into feasibility never itself HAS to stop the search, but it is always kept as a
+  // fallback candidate (exactly the textbook breakpoint) as well as, when the FAR bound is
+  // finite, offered as a longer alternative candidate for the SAME row: past the far bound
+  // the variable would swing out the other side and start making phase 1 worse again, so that
+  // is genuinely where it blocks. A row with only the fallback (no finite far bound, e.g. a
+  // one-sided >= constraint) still gets a candidate - the fallback IS its only real
+  // breakpoint, and dropping it would leave phase 1 with nothing to pivot on at all, which is
+  // exactly the bug an earlier version of this had: every currently-infeasible row with an
+  // unbounded far side produced no candidate, theta_max stayed infinite, and phase 1 reported
+  // "no blocking variable" on a model that was never unbounded.
+  //
+  // Both candidates for the same row carry the same pivot magnitude (same alpha), so pass two
+  // never prefers one over the other for stability; it only matters through theta_max, and
+  // the near-bound candidate's own relaxed step keeps that honestly capped even when the far
+  // one is offered too.
+  std::vector<RatioCandidate> candidates;
+  candidates.reserve(static_cast<std::size_t>(m_));
+
+  auto add_candidate = [&](Index slot, double x, double bound, double rate, bool to_upper,
+                           double sign_of_relaxation) {
+    double exact_step = (bound - x) / rate;
+    double relaxed_step = (bound + sign_of_relaxation * tol::kHarrisRelaxation - x) / rate;
+    if (exact_step < 0.0) exact_step = 0.0;
+    if (relaxed_step < 0.0) relaxed_step = 0.0;
+    theta_max = std::min(theta_max, relaxed_step);
+    candidates.push_back(
+        {slot, exact_step, to_upper, std::fabs(alpha_[static_cast<std::size_t>(slot)])});
+  };
+
+  for (Index slot = 0; slot < m_; ++slot) {
+    const double a = alpha_[static_cast<std::size_t>(slot)];
+    // rate = d(x_B[slot]) / dt as the entering variable moves in `direction`.
+    const double rate = -sign * a;
+    if (std::fabs(rate) <= tol::kPivotTolerance) continue;
+
+    const Index k = basis_[static_cast<std::size_t>(slot)];
+    const double x = x_basic_[static_cast<std::size_t>(slot)];
+    const double lo = lower_[static_cast<std::size_t>(k)];
+    const double hi = upper_[static_cast<std::size_t>(k)];
+
+    const Position position = phase_one ? position_of(slot) : Position::kFeasible;
+    switch (position) {
+      case Position::kBelowLower:
+        // Moving up (rate > 0) toward feasibility: the near bound (lo) is always a fallback
+        // candidate; the far bound (hi), if finite, is the long-step bonus.
+        if (rate > 0.0) {
+          if (is_finite_bound(lo)) add_candidate(slot, x, lo, rate, false, 1.0);
+          if (is_finite_bound(hi)) add_candidate(slot, x, hi, rate, true, 1.0);
+        }
+        break;
+      case Position::kAboveUpper:
+        if (rate < 0.0) {
+          if (is_finite_bound(hi)) add_candidate(slot, x, hi, rate, true, -1.0);
+          if (is_finite_bound(lo)) add_candidate(slot, x, lo, rate, false, -1.0);
+        }
+        break;
+      case Position::kFeasible:
+        // Already feasible: crossing OUT of feasibility in either direction genuinely blocks,
+        // exactly as the textbook test - there is no far bound to look past here.
+        if (rate > 0.0 && is_finite_bound(hi)) {
+          add_candidate(slot, x, hi, rate, true, 1.0);
+        } else if (rate < 0.0 && is_finite_bound(lo)) {
+          add_candidate(slot, x, lo, rate, false, -1.0);
+        }
+        break;
+    }
+  }
+
+  // PASS TWO. Among rows that still block within the relaxed limit, take the largest pivot
+  // magnitude - the numerically stable choice among the candidates pass one certified as
+  // safe. A candidate whose exact step is already comfortably inside theta_max is treated
+  // exactly like one sitting right at the limit; kRatioTestFeasibility is the same slack the
+  // textbook test used for its own ties.
+  Index best_slot = -1;
+  bool best_to_upper = false;
+  double best_pivot_magnitude = 0.0;
+  double best_exact_step = 0.0;
+  for (const RatioCandidate& candidate : candidates) {
+    if (candidate.exact_step > theta_max + tol::kRatioTestFeasibility) continue;
+    if (candidate.pivot_magnitude > best_pivot_magnitude) {
+      best_pivot_magnitude = candidate.pivot_magnitude;
+      best_slot = candidate.slot;
+      best_to_upper = candidate.to_upper;
+      best_exact_step = candidate.exact_step;
+    }
+  }
+
+  if (best_slot < 0) {
+    if (!(theta_max < std::numeric_limits<double>::infinity())) {
+      result.unbounded = true;
+      return result;
+    }
+    // Nothing blocked within the relaxed limit: theta_max came from the entering variable's
+    // own range, so this is a bound flip.
+    result.step = theta_max;
+    return result;
+  }
+
+  // The realised step is the WINNING row's own exact ratio, capped at the relaxed limit that
+  // admitted it into pass two - never the limit itself. This is what keeps the infeasibility
+  // introduced bounded by kHarrisRelaxation regardless of which row pass two picks, rather
+  // than by however far that row's own exact bound happens to sit from the tightest one.
+  result.step = std::min(best_exact_step, theta_max);
+  result.leaving_position = best_slot;
+  result.leaving_to_upper = best_to_upper;
+  return result;
+}
+
+// -----------------------------------------------------------------------------------------
+// Reporting
+// -----------------------------------------------------------------------------------------
+
+double Simplex::minimization_objective() const {
+  double sum = 0.0;
+  for (Index k = 0; k < n_; ++k) sum += cost_[static_cast<std::size_t>(k)] * variable_value(k);
+  // cost_ is stored in minimization sense; undo that and add the offset so the number in
+  // the iteration table is the same quantity the final line and the .sol file report.
+  return model_.sense_multiplier() * sum + model_.objective_offset;
+}
+
+Solution Simplex::finish(SolveStatus status, const std::string& message, Count iterations,
+                         double seconds) {
+  // The dual loop's time, by phase (#210), for whoever asks at verbose level.
+  double phase_total = 0.0;
+  for (const double t : dual_phase_seconds_) phase_total += t;
+  if (phase_total > 0.0) {
+    std::string breakdown;
+    for (std::size_t k = 0; k < dual_phase_seconds_.size(); ++k) {
+      if (!breakdown.empty()) breakdown += ", ";
+      breakdown +=
+          fmt::format("{} {:.2f}s ({:.0f}%)", kDualPhaseNames[k], dual_phase_seconds_[k],
+                      100.0 * dual_phase_seconds_[k] / phase_total);
+    }
+    logger_.verbose("dual simplex time by phase over {} iterations and {} refactorizations: {}",
+                    iterations, refactorizations_, breakdown);
+  }
+  // EVERY EXIT, not just the optimal one. The perturbation relaxes bounds, so any point
+  // reported while it is active belongs to a problem whose feasible region is slightly
+  // larger than the caller's. The optimal path already restores them before returning - it
+  // has to, since it goes on iterating - but there are ten other ways out of that loop:
+  // iteration limit, time limit, unbounded, infeasible, and six numerical failures.
+  //
+  // A point returned through any of those would be feasible for the relaxed bounds and
+  // violate the true ones by up to kPerturbationSize. At 1e-9 that is two orders under the
+  // feasibility tolerance, so nothing downstream would flag it and the answer would be
+  // quietly, slightly wrong - which is the failure mode this codebase treats as the worst
+  // one available. Restoring here, at the single choke point, means no exit can miss it.
+  remove_perturbation();
+
+  // ITERATIVE REFINEMENT, on the optimal exit only (#72). The basis is final and the
+  // factors are fresh (optimality is declared on fresh factors or not at all), so the
+  // residual of B x_B = -N x_N and of B^T y = c_B is exactly what those factors leave
+  // behind; two solves per step buy back the digits that rounding took. Not on any other
+  // exit: a limit or a failure has no basis worth polishing, and polishing one would
+  // manufacture a tidier-looking point for a claim that was never made.
+  if (status == SolveStatus::kOptimal) refine_final_basis();
+
+  // The ratio of refactorizations to iterations is the cheapest available read on how well
+  // the basis update is holding up: a run that refactorizes on most pivots has gained
+  // nothing, and a high rejection count means the bases being produced are ill conditioned.
+  logger_.info(
+      "Basis: {} refactorizations over {} iterations, {} declined as unsafe, {} forced "
+      "by the accuracy check; smallest pivot over all factorizations {}",
+      refactorizations_, iterations, rejected_updates_, accuracy_refactorizations_,
+      // "n/a" and NOT 0.000e+00 when nothing was recorded. A model with no rows factorizes
+      // nothing, and printing a zero there says "the basis was singular" - the strongest
+      // possible claim about conditioning - when what happened is that the question never
+      // arose. This whole line exists to make basis health legible; a plausible-looking
+      // number standing in for absent data is the one way it could mislead.
+      worst_basis_pivot_ > 0.0 ? fmt::format("{:.3e}", worst_basis_pivot_)
+                               : std::string("n/a (nothing was factorized)"));
+
+  // Repairs are reported only when they happened. A "0 repairs" on every well-behaved solve
+  // would be noise on the line that exists to make an ill-behaved one legible - but a solve
+  // that reached its answer by patching its own basis must never look like one that did not,
+  // because the patch moves the point and the answer is reached from somewhere else.
+  if (repairs_ > 0) {
+    logger_.info(
+        "Basis repair: {} column(s) replaced with logicals over {} repair(s); the "
+        "basis was rank deficient and the point was moved to mend it",
+        repaired_columns_, repairs_);
+  }
+
+  Solution solution;
+  solution.allocate_for(model_);
+  solution.status = status;
+  solution.algorithm = algorithm_name_;
+  solution.message = message;
+  solution.iterations = iterations;
+  solution.solve_seconds = seconds;
+  solution.refinement_steps = refinement_steps_;
+  solution.residual_before_refinement = residual_before_refinement_;
+  solution.residual_after_refinement = residual_after_refinement_;
+
+  // The certificate is attached before the early return below, because the two statuses
+  // that HAVE one are exactly the two that take it (#191).
+  if (status == SolveStatus::kInfeasible) solution.farkas_dual = pending_farkas_;
+  if (status == SolveStatus::kUnbounded) solution.primal_ray = pending_ray_;
+
+  // UNBOUNDED HAS A POINT, and it is half of the proof (#191). The ratio test only reaches
+  // that verdict in phase 2, which means the current basic solution is FEASIBLE; a ray is
+  // only evidence of an unbounded objective when it starts somewhere the model allows, so
+  // the point is written alongside it. The objective and the bound keep their unbounded
+  // convention below: what is being reported is still "no finite optimum", not this point's
+  // value.
+  const bool have_point = status == SolveStatus::kOptimal || status == SolveStatus::kFeasible ||
+                          status == SolveStatus::kIterationLimit ||
+                          status == SolveStatus::kTimeLimit ||
+                          status == SolveStatus::kUnbounded;
+  if (!have_point) {
+    solution.recompute_quality(model_);
+    solution.dual_bound = status == SolveStatus::kInfeasible ? kInfinity : -kInfinity;
+    return solution;
+  }
+
+  const double sense = model_.sense_multiplier();
+  for (Index j = 0; j < n_; ++j) {
+    solution.col_value[static_cast<std::size_t>(j)] = normalize_zero(variable_value(j));
+    solution.col_dual[static_cast<std::size_t>(j)] =
+        normalize_zero(sense * reduced_cost_[static_cast<std::size_t>(j)]);
+    solution.col_status[static_cast<std::size_t>(j)] = status_[static_cast<std::size_t>(j)];
+  }
+  for (Index i = 0; i < m_; ++i) {
+    // The reduced cost of logical i is 0 - y^T(-e_i) = y_i, so the row dual IS y_i. The
+    // sense multiplier converts it back into the units of the file the user handed us.
+    solution.row_dual[static_cast<std::size_t>(i)] =
+        normalize_zero(sense * y_[static_cast<std::size_t>(i)]);
+    solution.row_status[static_cast<std::size_t>(i)] =
+        status_[static_cast<std::size_t>(n_ + i)];
+  }
+
+  // The dual bound must be stated BEFORE recompute_quality(), because that is what derives
+  // absolute_gap and relative_gap from it. Setting it afterwards left both gaps measured
+  // against a bound of zero, so every proven-optimal LP reported relative_gap = 1.
+  //
+  // And only an OPTIMAL basis proves a bound. On an iteration or time limit the point in
+  // hand is an incumbent, not a proof; claiming the objective as a dual bound there asserts
+  // an optimality that was never established, which a Phase 5 branch-and-bound would then
+  // happily prune against. An unknown bound is the infinity on the unexplored side of the
+  // objective, and yields an infinite gap rather than a fake zero.
+  if (status == SolveStatus::kOptimal) {
+    solution.dual_bound = model_.evaluate_objective(solution.col_value.data());
+  } else {
+    solution.dual_bound = model_.sense == ObjSense::kMaximize ? kInfinity : -kInfinity;
+  }
+  solution.recompute_quality(model_);
+  return solution;
+}
+
+// -----------------------------------------------------------------------------------------
+// The iteration loop
+// -----------------------------------------------------------------------------------------
+
+bool Simplex::seed_basis(const WarmStart& warm) {
+  if (warm.col_status.size() != static_cast<std::size_t>(n_) ||
+      warm.row_status.size() != static_cast<std::size_t>(m_)) {
+    return false;
+  }
+  Index basic = 0;
+  for (Index j = 0; j < n_; ++j) {
+    if (warm.col_status[static_cast<std::size_t>(j)] == BasisStatus::kBasic) ++basic;
+  }
+  for (Index i = 0; i < m_; ++i) {
+    if (warm.row_status[static_cast<std::size_t>(i)] == BasisStatus::kBasic) ++basic;
+  }
+  if (basic != m_) return false;
+
+  basis_.clear();
+  basis_.reserve(static_cast<std::size_t>(m_));
+  basis_position_.assign(static_cast<std::size_t>(total_), -1);
+  status_.assign(static_cast<std::size_t>(total_), BasisStatus::kUnknown);
+  nonbasic_value_.assign(static_cast<std::size_t>(total_), 0.0);
+  for (Index k = 0; k < total_; ++k) {
+    const auto u = static_cast<std::size_t>(k);
+    const BasisStatus given =
+        k < n_ ? warm.col_status[u] : warm.row_status[static_cast<std::size_t>(k - n_)];
+    if (given == BasisStatus::kBasic) {
+      basis_position_[u] = static_cast<Index>(basis_.size());
+      basis_.push_back(k);
+      status_[u] = BasisStatus::kBasic;
+      continue;
+    }
+    // A nonbasic status is honoured when the bound it names exists under THIS model's
+    // bounds - branching may have moved them since the status was reported - and
+    // otherwise the nearest available bound is taken, exactly as a repair would.
+    const double lo = lower_[u];
+    const double hi = upper_[u];
+    if (lo == hi) {
+      status_[u] = BasisStatus::kFixed;
+      nonbasic_value_[u] = lo;
+    } else if (given == BasisStatus::kAtLower && is_finite_bound(lo)) {
+      status_[u] = BasisStatus::kAtLower;
+      nonbasic_value_[u] = lo;
+    } else if (given == BasisStatus::kAtUpper && is_finite_bound(hi)) {
+      status_[u] = BasisStatus::kAtUpper;
+      nonbasic_value_[u] = hi;
+    } else if (given == BasisStatus::kNonbasicFree && !is_finite_bound(lo) &&
+               !is_finite_bound(hi)) {
+      status_[u] = BasisStatus::kNonbasicFree;
+      nonbasic_value_[u] = 0.0;
+    } else {
+      make_nonbasic(k, 0.0);
+    }
+  }
+  return true;
+}
+
+std::optional<Solution> Simplex::prepare(const WarmStart* warm, const Timer& timer) {
+  primal_tolerance_ = options_.get_double("primal_feasibility_tolerance");
+  dual_tolerance_ = options_.get_double("dual_feasibility_tolerance");
+  refactor_work_ratio_ = options_.get_double("refactor_work_ratio");
+  if (!(primal_tolerance_ > 0.0)) primal_tolerance_ = tol::kPrimalFeasibility;
+  if (!(dual_tolerance_ > 0.0)) dual_tolerance_ = tol::kDualFeasibility;
+
+  time_limit_ = options_.get_double("time_limit");
+  iteration_limit_ = options_.get_int("iteration_limit");
+
+  // Dantzig is kept reachable so the before/after in issue #66 can be REGENERATED rather
+  // than quoted from a commit message, and so a suspected pricing bug can be bisected
+  // against the rule this replaced without checking out an old tree.
+  // DEVEX IS THE DEFAULT (issue #66), measured rather than assumed - the table is on the
+  // member declaration above. The history is worth one paragraph because it is a lesson
+  // about ordering: devex was held back for a singular-basis failure on grow22 that survived
+  // a weight audit and the Harris ratio test, and turned out to be a defect in the LU (#144)
+  // and the absence of basis repair (#147), not in the pricing. A pricing rule that steers
+  // towards ill-conditioned bases exposes weaknesses below it; fix those first, then measure
+  // the rule again.
+  const std::string pricing = options_.get_string("pricing");
+  devex_ = pricing != "dantzig";
+  if (pricing != "devex" && pricing != "dantzig" && !pricing.empty()) {
+    logger_.warning("pricing '{}' is not recognised; using devex", pricing);
+    devex_ = true;
+  }
+
+  // TEXTBOOK IS THE DEFAULT (issue #67), measured rather than assumed. Harris passes 40/50 on
+  // the medium tier against the textbook rule's 41/50 under the same (default) Dantzig
+  // pricing - see ratio_test_ above for the instance and the number. Kept selectable so this
+  // can be re-measured without reimplementing it.
+  const std::string ratio_test_choice = options_.get_string("ratio_test");
+  harris_ratio_test_ = ratio_test_choice == "harris";
+  if (ratio_test_choice != "harris" && ratio_test_choice != "textbook" &&
+      !ratio_test_choice.empty()) {
+    logger_.warning("ratio_test '{}' is not recognised; using textbook", ratio_test_choice);
+    harris_ratio_test_ = false;
+  }
+
+  build_working_problem();
+  warm_started_ = warm != nullptr && !warm->empty() && seed_basis(*warm);
+  if (warm != nullptr && !warm->empty() && !warm_started_) {
+    logger_.verbose(
+        "the warm start does not describe a basis of this model; starting from "
+        "the slack basis");
+  }
+  if (!warm_started_) set_initial_basis();
+
+  if (!refactorize()) {
+    if (factors_abandoned_) return factorization_failed(0, timer);
+    if (!warm_started_) {
+      return finish(SolveStatus::kNumericalError, "the initial slack basis is singular", 0,
+                    timer.elapsed_seconds());
+    }
+    // refactorize() already tried the Markowitz ladder and one repair. A warm basis that
+    // is still singular after that is not worth more: the slack basis always factorizes.
+    logger_.verbose(
+        "the warm-start basis is singular even after repair; starting from the "
+        "slack basis");
+    warm_started_ = false;
+    set_initial_basis();
+    if (!refactorize()) {
+      if (factors_abandoned_) return factorization_failed(0, timer);
+      return finish(SolveStatus::kNumericalError, "the initial slack basis is singular", 0,
+                    timer.elapsed_seconds());
+    }
+  }
+  compute_basic_values();
+  return std::nullopt;
+}
+
+Solution Simplex::run(const WarmStart* warm) {
+  Timer timer;
+  time_limit_ = options_.get_double("time_limit");
+  arm_deadline(timer);
+  if (std::optional<Solution> early = prepare(warm, timer)) return *early;
+
+  logger_.info("Primal simplex: {} rows, {} columns, {} nonzeros{}", m_, n_,
+               model_.num_nonzeros(), warm_started_ ? ", warm start" : "");
+  logger_.begin_iteration_table();
+
+  Count iterations = 0;
+  return primal_loop(timer, &iterations);
+}
+
+Solution Simplex::primal_loop(Timer& timer, Count* iterations_io) {
+  Count& iterations = *iterations_io;
+  const double time_limit = time_limit_;
+  const std::int64_t iteration_limit = iteration_limit_;
+  int degenerate_run = 0;
+  bool bland = false;
+  bool was_phase_one = true;
+
+  for (;;) {
+    // The phase decision is made on the largest single violation, not on their sum. The sum
+    // is still computed for the iteration log, where it is the objective being minimised.
+    const double infeasibility = max_infeasibility();
+    const bool phase_one = infeasibility > primal_tolerance_;
+    if (was_phase_one && !phase_one) {
+      logger_.info("Phase 1 complete after {} iterations: primal feasible", iterations);
+      degenerate_run = 0;
+      bland = false;
+      // The composite phase-1 objective is a different function from the phase-2 one, so
+      // weights accumulated against the first approximate edge norms for an objective that
+      // no longer exists. Carrying them across is not a slow start, it is wrong information.
+      reset_devex();
+    }
+    was_phase_one = phase_one;
+
+    iterations_seen_ = iterations;
+    compute_reduced_costs(phase_one);
+
+    if (iterations % 20 == 0) {
+      logger_.iteration(iterations, minimization_objective(), infeasibility, -1.0,
+                        timer.elapsed_seconds());
+    }
+
+    int direction = 0;
+    const Index entering = price(bland, &direction);
+
+    if (entering < 0) {
+      if (phase_one) {
+        // Phase 1 is bounded below by zero, so its true minimum being positive would indeed
+        // prove that no feasible point exists. What is observed here is weaker: no column
+        // PRICES as improving to within the dual tolerance. On a badly scaled basis that
+        // happens while an improving direction still exists, so a stall is evidence, not a
+        // proof, and the strength of the evidence depends on how far from feasible we are.
+        //
+        // A residual within a couple of orders of magnitude of the feasibility tolerance is a
+        // numerical stall and is reported as one. Claiming kInfeasible there tells a planner
+        // their model has no solution when it has one, which is the least checkable and most
+        // damaging answer this solver can give.
+        if (infeasibility <= kInfeasibilityProofFactor * primal_tolerance_) {
+          return finish(SolveStatus::kNumericalError,
+                        fmt::format("phase 1 stalled at max bound violation {:.3e}, only just "
+                                    "above the {:.1e} feasibility tolerance; no column prices "
+                                    "as improving, but this is a numerical stall rather than "
+                                    "a proof that the model is infeasible",
+                                    infeasibility, primal_tolerance_),
+                        iterations, timer.elapsed_seconds());
+        }
+        // THE PROOF, KEPT (#191). y_ was set by compute_reduced_costs(phase_one) at the
+        // top of this iteration: it is B^-T applied to the phase-1 cost vector, which is
+        // precisely a Farkas vector for the rows. It is handed over as a CANDIDATE - the
+        // bounds it was computed under may have been perturbed, and the model may be a
+        // scaled one - and solve() checks it against the original model before anyone sees
+        // it. A candidate that fails that check is dropped, never published.
+        pending_farkas_ = y_;
+        return finish(
+            SolveStatus::kInfeasible,
+            fmt::format("phase 1 terminated with max bound violation {:.3e}, far above the "
+                        "{:.1e} feasibility tolerance",
+                        infeasibility, primal_tolerance_),
+            iterations, timer.elapsed_seconds());
+      }
+      // OPTIMAL FOR THE PERTURBED PROBLEM IS NOT OPTIMAL. The bounds were relaxed to break
+      // a stall; reporting this point would answer a question nobody asked, and the answer
+      // would be feasible-looking and slightly wrong. Restore the true bounds and keep
+      // going - the basis is retained, so the clean finish is usually a handful of pivots.
+      if (perturbed_) {
+        logger_.verbose("optimal under perturbation; restoring exact bounds at iteration {}",
+                        iterations);
+        remove_perturbation();
+        bland = false;
+        degenerate_run = 0;
+        continue;
+      }
+      // OPTIMALITY IS DECLARED ON FRESH FACTORS OR NOT AT ALL. "No column prices as
+      // improving" was decided from reduced costs computed by BTRAN through whatever eta
+      // file was in play, and on an ill-conditioned basis those can be wrong by more than
+      // the dual tolerance in either direction - so the test can pass on a basis that is
+      // not dual feasible. Measured on grow7: the exit basis reports a reduced cost off by
+      // 0.66, eight thousand times the tolerance, from fresh factors; the pricing that
+      // stopped there had seen a smaller number through the etas. On etamacro the same
+      // mechanism leaves a duality gap of 1.7e-09 the verifier rejects at 1e-09.
+      //
+      // So: if updates are in play, refactorize and go round once more. The top of the loop
+      // recomputes the reduced costs from the fresh factors; if a column now prices as
+      // improving the search continues from a point it should never have stopped at, and if
+      // none does, eta_count() is zero and this branch declares optimality with the duals
+      // it is about to report. It cannot loop: a refactorization empties the eta file, and
+      // only a pivot refills it.
+      if (m_ > 0 && lu_.eta_count() > 0) {
+        if (!refactorize()) return factorization_failed(iterations, timer);
+        ++refactorizations_;
+        compute_basic_values();
+        logger_.verbose(
+            "iteration {}: no improving column through the eta file; re-pricing "
+            "on fresh factors before declaring optimality",
+            iterations);
+        continue;
+      }
+      return finish(SolveStatus::kOptimal, {}, iterations, timer.elapsed_seconds());
+    }
+
+    ftran_entering_column(entering);
+
+    // DOES THE WEIGHT STILL APPROXIMATE ANYTHING? alpha is B^-1 a_q, so the exact
+    // steepest-edge norm of the column just chosen is one dot product away, and devex
+    // guarantees w_q <= gamma_q. A weight that has climbed above gamma is not a slightly
+    // stale estimate, it is wrong in the direction that makes pricing avoid good columns.
+    // Checking the entering column alone, once per iteration, is enough to notice: it is
+    // the column whose weight the ranking just acted on.
+    if (devex_) {
+      double gamma = 1.0;
+      for (Index slot = 0; slot < m_; ++slot) {
+        const double v = alpha_[static_cast<std::size_t>(slot)];
+        gamma += v * v;
+      }
+      const double weight = devex_weight_[static_cast<std::size_t>(entering)];
+      if (weight > kDevexAccuracyFactor * gamma) reset_devex();
+    }
+
+    // Periodically ask whether the updated factors still represent the basis, and rebuild
+    // them when they do not. This measures the property that matters rather than guessing at
+    // it: an earlier version inferred trouble from the Markowitz threshold ladder having
+    // fired, which is a proxy for conditioning and not for accuracy, and it left d6cube 1.8x
+    // slower than never updating at all.
+    if (lu_.eta_count() > 0 && iterations % kAccuracyCheckInterval == 0) {
+      const double residual = ftran_residual(entering);
+      if (residual > kUpdateAccuracyTolerance) {
+        ++accuracy_refactorizations_;
+        if (!refactorize()) return factorization_failed(iterations, timer);
+        ++refactorizations_;
+        ftran_entering_column(entering);
+      }
+    }
+
+    RatioResult ratio = ratio_test(entering, direction, phase_one);
+
+    // A CATASTROPHIC CLAIM IS CHECKED AGAINST FRESH FACTORS BEFORE IT IS MADE. "No blocking
+    // variable" is the ratio test saying the entering column can move forever: unbounded in
+    // phase 2, and in phase 1 an impossibility, since that objective is bounded below by
+    // zero. Both are statements about alpha = B^-1 a_q, and alpha computed through an eta
+    // file on a poorly conditioned basis can be wrong in exactly the way that produces them
+    // - every entry that should block reads as zero or the wrong sign. Measured on maros-r7:
+    // with an eta file in play the solver reported UNBOUNDED on a model whose optimum is
+    // published, where a fresh factorization at the same iteration does not. That is the
+    // worst answer this solver can give, and it costs one refactorization to make sure.
+    //
+    // So: if the claim was reached through updates, refactorize, recompute alpha from the
+    // fresh factors, and run the ratio test again. Only a claim that survives fresh factors
+    // is made. A claim that does not survive was the eta file talking, and the iteration
+    // simply continues with the corrected alpha.
+    if (ratio.unbounded && lu_.eta_count() > 0) {
+      if (!refactorize()) return factorization_failed(iterations, timer);
+      ++refactorizations_;
+      ftran_entering_column(entering);
+      ratio = ratio_test(entering, direction, phase_one);
+      if (!ratio.unbounded) {
+        logger_.verbose(
+            "iteration {}: no blocking variable through the eta file, but one "
+            "exists under fresh factors; continuing",
+            iterations);
+      }
+    }
+
+    if (ratio.unbounded) {
+      if (phase_one) {
+        return finish(SolveStatus::kNumericalError,
+                      "phase 1 ratio test found no blocking variable, which cannot happen "
+                      "for an objective bounded below by zero",
+                      iterations, timer.elapsed_seconds());
+      }
+      // Only a claim whose ray checks out is made. Measured on maros-r7, whose optimum is
+      // published: the ratio test found no blocking variable on fresh factors of a basis
+      // that had needed full partial pivoting, and the "ray" it proposed had a residual far
+      // above tolerance - alpha was wrong, not the model. Reporting UNBOUNDED there is the
+      // worst answer available; reporting a numerical failure is the true one.
+      const double ray_residual = unbounded_ray_residual(entering, direction);
+      // The same direction the residual above was measured on, kept rather than rebuilt.
+      pending_ray_ = unbounded_ray(entering, direction);
+      if (ray_residual > primal_tolerance_) {
+        return finish(SolveStatus::kNumericalError,
+                      fmt::format("ratio test found no blocking variable at iteration {}, but "
+                                  "the proposed unbounded ray has residual {:.3e} relative to "
+                                  "its terms; alpha is not trustworthy on this basis and the "
+                                  "claim is withheld",
+                                  iterations, ray_residual),
+                      iterations, timer.elapsed_seconds());
+      }
+      return finish(SolveStatus::kUnbounded, {}, iterations, timer.elapsed_seconds());
+    }
+
+    const double step = ratio.step;
+    if (step <= tol::kRatioTestFeasibility) {
+      ++degenerate_run;
+      // PERTURB BEFORE FALLING BACK TO BLAND. Bland is a termination guarantee bought with
+      // arithmetic quality; perturbation removes the ties that caused the stall instead of
+      // arbitrating them, and costs nothing when it works. Bland remains below as the
+      // last resort for a stall perturbation did not clear.
+      if (!perturbed_ && degenerate_run > kPerturbationTrigger) {
+        logger_.verbose("{} consecutive degenerate iterations: perturbing bounds by up to {:g}",
+                        degenerate_run, kPerturbationSize);
+        perturb_bounds();
+        compute_basic_values();
+        degenerate_run = 0;
+        continue;
+      }
+
+      if (!bland && degenerate_run > tol::kBlandSwitchIterations) {
+        logger_.verbose("{} consecutive degenerate iterations: switching to Bland's rule",
+                        degenerate_run);
+        bland = true;
+      }
+      // Bland's rule is proved non-cycling for the classical simplex. The composite phase-1
+      // objective redefines itself whenever the infeasible set changes, so that proof does
+      // not carry over untouched, and a stall must be reported rather than spun on.
+      if (degenerate_run > kStallLimit) {
+        compute_reduced_costs(false);
+        return finish(SolveStatus::kNumericalError,
+                      fmt::format("stalled: {} consecutive degenerate iterations under "
+                                  "Bland's rule",
+                                  degenerate_run),
+                      iterations, timer.elapsed_seconds());
+      }
+    } else {
+      degenerate_run = 0;
+      bland = false;
+    }
+
+    const auto e = static_cast<std::size_t>(entering);
+    const double entering_value = nonbasic_value_[e] + static_cast<double>(direction) * step;
+
+    if (ratio.leaving_position < 0) {
+      // Bound flip: the entering variable travels its whole range and the basis is unchanged.
+      nonbasic_value_[e] = (direction > 0) ? upper_[e] : lower_[e];
+      status_[e] = (direction > 0) ? BasisStatus::kAtUpper : BasisStatus::kAtLower;
+      compute_basic_values();
+    } else {
+      const auto slot = static_cast<std::size_t>(ratio.leaving_position);
+      const Index leaving = basis_[slot];
+      const auto l = static_cast<std::size_t>(leaving);
+
+      // BEFORE the basis changes, and before the factors are updated. The weight update
+      // needs rho = B^-T e_r under the basis this pivot is leaving, and it reads
+      // basis_[leaving_row] to find the departing variable - both are about to be
+      // overwritten. A bound flip never reaches here, which is correct: nothing leaves the
+      // basis, so no edge changes and no weight is stale.
+      update_devex_weights(entering, ratio.leaving_position,
+                           alpha_[static_cast<std::size_t>(ratio.leaving_position)]);
+
+      basis_position_[l] = -1;
+      // Snap the departing variable exactly onto the bound it hit. Leaving it at the
+      // computed value would let a 1e-16 residual accumulate into a genuine bound violation
+      // over hundreds of pivots.
+      if (ratio.leaving_to_upper) {
+        nonbasic_value_[l] = upper_[l];
+        status_[l] = BasisStatus::kAtUpper;
+      } else {
+        nonbasic_value_[l] = lower_[l];
+        status_[l] = BasisStatus::kAtLower;
+      }
+      if (lower_[l] == upper_[l]) status_[l] = BasisStatus::kFixed;
+
+      basis_[slot] = entering;
+      basis_position_[e] = ratio.leaving_position;
+      status_[e] = BasisStatus::kBasic;
+      nonbasic_value_[e] = entering_value;
+
+      // A pivot changes ONE column of the basis, so the factorization is updated rather than
+      // rebuilt. alpha_ already holds B^-1 a for the entering column - the ratio test needed
+      // it - so the update is free of any extra solve.
+      //
+      // Refactorize when the update declines the pivot as numerically unsafe, or when the
+      // eta file has grown enough that it costs more per solve than fresh factors would.
+      // Both paths matter: refactorizing every iteration was slow but had no accumulated
+      // update error, and that property is only preserved by taking the trigger seriously.
+      // Two independent controls, and they answer different questions.
+      //
+      // The accuracy check above asks whether the factors still represent the basis. On
+      // d6cube it fires essentially never - the product form stays accurate to better than
+      // 1e-9 relative residual for thousands of pivots - so drift is NOT what goes wrong
+      // there.
+      //
+      // What goes wrong is the pivot path. Even with faithful factors, alpha computed
+      // through base-plus-etas differs from alpha computed through fresh factors in the last
+      // bits, and on a massively degenerate model those bits decide which row wins the ratio
+      // test. d6cube then takes 38634 pivots to reach the same singular basis it reaches in
+      // 1947 without the update. Neither run produces an answer; one just wastes twenty times
+      // as long failing.
+      //
+      // That is not fixable by controlling accuracy, because accuracy is not the problem -
+      // the real remedy is anti-degeneracy machinery (Harris ratio test, perturbation, #67).
+      // Until then the update is switched off on a basis the factorization has already
+      // flagged as poorly conditioned, which is where its benefit is least reliable and where
+      // this behaviour shows up. It is containment, not a fix, and is described as such.
+      const bool trust_update = !basis_needed_stricter_threshold_;
+      const bool updated = trust_update && lu_.update(ratio.leaving_position, alpha_.data());
+      if (trust_update && !updated) ++rejected_updates_;
+      // REFACTORIZE AT THE MEASURED BREAK-EVEN. The eta file makes every solve a little
+      // slower, and a fresh factorization removes that cost at a price of its own. The old
+      // rule refactorized once the eta file reached twice the size of the factors, which
+      // assumes the two costs are comparable per nonzero. They are not: measured on d2q06c,
+      // one refactorization costs ~44 ms and one iteration's solves ~0.2 ms, so that rule
+      // refactorized every 22 iterations and spent 68% of the run doing it. Raising the
+      // ratio to 8 made d2q06c 2.2x faster and greenbea 1.8x SLOWER - the break-even is a
+      // property of the instance, and no constant is right for both.
+      //
+      // So it is adaptive, in OPERATION COUNTS. Every iteration adds the eta file's current
+      // nonzero count to a running total - the extra work its solves did through the etas -
+      // and the simplex refactorizes when that total exceeds refactor_work_ratio_ times the
+      // size of the base factors, which is the work a refactorization is proportional to.
+      // The ratio was calibrated from wall-clock measurements, once, offline.
+      //
+      // NOT SECONDS, AND THIS IS NOT A DETAIL. The first version of this rule compared
+      // measured solve time against measured refactorization time. It was faster - and it
+      // made the solver NONDETERMINISTIC: refactorization points moved with the clock, alpha
+      // through etas differs from alpha through fresh factors in its last bits, and on a
+      // degenerate model those bits pick the ratio-test winner. perold took 8120 iterations
+      // in one run and 8948 in the next, on the same commit, and reported different duals.
+      // docs/CONTRIBUTING.md's evidence rules are worth nothing if a rerun can take a different path;
+      // the perturbation code turned down randomness for exactly this reason, and a timer is
+      // randomness with extra steps. Wall-clock may calibrate a constant. It may not decide.
+      //
+      // The hard cap on eta count stays, as the bound on accumulated drift.
+      eta_work_since_refactor_ += static_cast<double>(lu_.eta_nonzeros());
+      const bool past_break_even =
+          eta_work_since_refactor_ >
+          refactor_work_ratio_ * std::max(1.0, static_cast<double>(lu_.factor_nonzeros()));
+      if (!updated || past_break_even || lu_.should_refactorize()) {
+        if (!refactorize()) return factorization_failed(iterations, timer);
+        ++refactorizations_;
+      }
+      compute_basic_values();
+    }
+
+    ++iterations;
+
+    if (iteration_limit >= 0 && iterations >= iteration_limit) {
+      compute_reduced_costs(false);
+      return finish(SolveStatus::kIterationLimit,
+                    fmt::format("iteration limit {} reached", iteration_limit), iterations,
+                    timer.elapsed_seconds());
+    }
+    const double elapsed = timer.elapsed_seconds();
+    if (elapsed > time_limit) {
+      compute_reduced_costs(false);
+      return finish(SolveStatus::kTimeLimit,
+                    fmt::format("time limit {:g}s reached", time_limit), iterations, elapsed);
+    }
+    if (control_ != nullptr) {
+      Progress progress;
+      progress.phase = SolvePhase::kLp;
+      progress.iterations = iterations;
+      progress.objective = minimization_objective();
+      progress.best_bound = progress.objective;
+      progress.elapsed_seconds = elapsed;
+      if (control_->poll(progress)) {
+        compute_reduced_costs(false);
+        return finish(SolveStatus::kInterrupted,
+                      fmt::format("interrupted after {} iterations", iterations), iterations,
+                      elapsed);
+      }
+    }
+  }
+}
+
+}  // namespace detail
+
+/// Number of Ruiz equilibration passes. Ruiz proves geometric convergence of the row and
+/// column infinity norms toward 1, so a handful of passes captures nearly all of the
+/// available improvement; PDLP section 4.1 uses ten and reports the tail as negligible.
+constexpr int kRuizIterations = 10;
+
+Solution solve_primal_simplex(const Model& model, const Options& options, Logger& logger,
+                              SolveControl* control) {
+  // WHY THE SIMPLEX IS SCALED. It was assumed for a long time that it need not be - a
+  // simplex pivots on ratios, so a uniform rescaling of a row cancels. That reasoning is
+  // correct about the ALGEBRA and wrong about the ARITHMETIC, and the Netlib medium tier
+  // said so: 18 of its 24 failures were the identical message "basis became singular", on
+  // the known badly scaled corner of the set (fit1d, fit2d, israel, pilot4, e226, ...).
+  // fit1d failed after 23 iterations, far too early for accumulated drift. The bases were
+  // ill-conditioned from the start because the model was.
+  //
+  // Markowitz threshold pivoting (issue #22) helped, but it only chooses among the pivots
+  // available; scaling changes which pivots exist at all. See issue #49.
+  return solve_primal_simplex(model, options, logger, build_node_scaling(model, options),
+                              control);
+}
+
+NodeScaling build_node_scaling(const Model& model, const Options& options) {
+  NodeScaling cache;
+  if (!options.get_bool("scaling")) return cache;  // invalid, and deliberately so
+  // Cost is passed in the ORIGINAL sense, not minimise space. build_scaling only multiplies
+  // it by the column multipliers, and the multipliers themselves come from matrix norms, so
+  // the sense never enters; folding it in here would mean unfolding it again below.
+  cache.scaling = build_scaling(model, model.col_cost, kRuizIterations);
+  cache.valid = true;
+  return cache;
+}
+
+Solution solve_primal_simplex(const Model& model, const Options& options, Logger& logger,
+                              const NodeScaling& cache, SolveControl* control) {
+  return detail::solve_with_scaling(model, options, logger, cache, detail::Engine::kPrimal,
+                                    nullptr, control);
+}
+
+Solution solve_dual_simplex(const Model& model, const Options& options, Logger& logger,
+                            const WarmStart* warm, SolveControl* control) {
+  return solve_dual_simplex(model, options, logger, build_node_scaling(model, options), warm,
+                            control);
+}
+
+Solution solve_dual_simplex(const Model& model, const Options& options, Logger& logger,
+                            const NodeScaling& cache, const WarmStart* warm,
+                            SolveControl* control) {
+  return detail::solve_with_scaling(model, options, logger, cache, detail::Engine::kDual, warm,
+                                    control);
+}
+
+namespace detail {
+
+Solution solve_with_scaling(const Model& model, const Options& options, Logger& logger,
+                            const NodeScaling& cache, Engine engine, const WarmStart* warm,
+                            SolveControl* control) {
+  // One place chooses the loop, so the scaled attempt and the unscaled retry below cannot
+  // disagree about which method they are running.
+  const auto run_engine = [&](const Model& problem, const Options& problem_options) {
+    Simplex simplex(problem, problem_options, logger, control);
+    return engine == Engine::kDual ? simplex.run_dual(warm) : simplex.run(warm);
+  };
+  if (!cache.valid) return run_engine(model, options);
+
+  // THE CACHE'S PRECONDITION, CHECKED RATHER THAN TRUSTED. The multipliers are indexed by
+  // column and row, so a cache built from a model of different dimensions would read past
+  // the end of them - undefined behaviour, reached through a header comment being ignored.
+  // The dimensions are the cheap half of the contract; a caller that changed the matrix
+  // WITHOUT changing its shape is still on its honour, and the header says so.
+  //
+  // Rebuilding is the right response rather than refusing: the answer stays correct, only
+  // the saving is lost, and a warning says why.
+  const bool shape_matches =
+      cache.scaling.column.size() == static_cast<std::size_t>(model.num_cols()) &&
+      cache.scaling.row.size() == static_cast<std::size_t>(model.num_rows());
+  if (!shape_matches) {
+    logger.warning(
+        "the scaling cache was built for a {}x{} model but this one is {}x{}; rebuilding it",
+        cache.scaling.row.size(), cache.scaling.column.size(), model.num_rows(),
+        model.num_cols());
+    return solve_with_scaling(model, options, logger, build_node_scaling(model, options),
+                              engine, warm, control);
+  }
+
+  const Scaling& scaling = cache.scaling;
+
+  Model scaled = model;
+  scaled.matrix = scaling.matrix;
+  scaled.col_cost = scaling.cost;
+  // BOUNDS ARE RESCALED HERE, not taken from the cache. The cache carries the bounds of the
+  // model it was built from, and the whole point of reusing it is that branching has changed
+  // them since. Taking scaling.col_lower would solve the ROOT relaxation at every node - a
+  // search that explores thousands of nodes and returns the root answer, with nothing in the
+  // output to say so.
+  //
+  // x = Dc xhat, so a bound on x becomes bound / dc on xhat, which is what build_scaling
+  // does; this is the same transformation applied to whichever bounds this node holds.
+  const Index cols = model.num_cols();
+  const Index rows_count = model.num_rows();
+  scaled.col_lower.resize(static_cast<std::size_t>(cols));
+  scaled.col_upper.resize(static_cast<std::size_t>(cols));
+  for (Index j = 0; j < cols; ++j) {
+    const auto u = static_cast<std::size_t>(j);
+    const double dc = scaling.column[u];
+    scaled.col_lower[u] =
+        is_finite_bound(model.col_lower[u]) ? model.col_lower[u] / dc : model.col_lower[u];
+    scaled.col_upper[u] =
+        is_finite_bound(model.col_upper[u]) ? model.col_upper[u] / dc : model.col_upper[u];
+  }
+  // Row bounds are rescaled the same way rather than reused, for the same reason: nothing
+  // guarantees a caller has not changed them, and the cost is one pass over m doubles.
+  scaled.row_lower.resize(static_cast<std::size_t>(rows_count));
+  scaled.row_upper.resize(static_cast<std::size_t>(rows_count));
+  for (Index i = 0; i < rows_count; ++i) {
+    const auto u = static_cast<std::size_t>(i);
+    const double dr = scaling.row[u];
+    scaled.row_lower[u] =
+        is_finite_bound(model.row_lower[u]) ? model.row_lower[u] * dr : model.row_lower[u];
+    scaled.row_upper[u] =
+        is_finite_bound(model.row_upper[u]) ? model.row_upper[u] * dr : model.row_upper[u];
+  }
+  // sense, objective_offset, col_type and the names are carried unchanged: a diagonal change
+  // of variable leaves the objective VALUE alone, so no offset correction is needed.
+
+  logger.debug("Scaling: entries {:.3e} to {:.3e} after {} Ruiz passes and one Pock-Chambolle",
+               scaling.min_abs, scaling.max_abs, kRuizIterations);
+
+  // ONE BUDGET, SHARED. The scaled solve and the unscaled retry below are a portfolio: on
+  // most models scaling wins, on a few it stalls where the unscaled simplex does not, and
+  // the union of the two is what the pass rate is built on. A portfolio has to share the
+  // caller's time limit rather than spend it twice. The old code spent it twice - a
+  // time-limited scaled solve triggered a full unscaled retry, so a 120 s limit ran for 241 s
+  // on every timed-out instance - and degen3 "passed" only that way: 120 s wasted in a
+  // scaled stall of 265,000 iterations, then an unscaled solve that takes 6 seconds.
+  //
+  // So the scaled attempt gets half the limit and the retry gets whatever is left. Half is
+  // not tuned; it is the split that guarantees the retry a real share when the first attempt
+  // fails outright. What it costs is any model that scaling solves in more than half the
+  // budget. On the full Netlib set at a 120 s limit the scaled attempt needs up to 55 s on a
+  // cool machine (pilot87 54.4 s, fit2p 50.2 s, bench/results/netlib-full-59ac6e3.csv), so
+  // the half share is the binding constraint on the two largest solvable instances whenever
+  // the machine is slower than that (#172). A caller who knows better sets a larger limit or
+  // turns scaling off.
+  //
+  // THE ROUTE IS RECORDED (#172). Under a time limit the clock decides whether the scaled
+  // attempt finishes, and with it which attempt's iterations the answer carries: fit2p took
+  // 10,432 scaled iterations on one machine and, on one 1.5x slower, 5,290 unscaled ones
+  // after the scaled attempt ran out its share - same objective to 1e-11, both verified. A
+  // time limit cannot be made clock-independent, so the choice it made is written into the
+  // message instead of being inferred later from an iteration count that does not match.
+  // Without a time limit the route depends on the numerics alone and is deterministic; a
+  // note is still attached when the scaled attempt fails, minus the time figures.
+  const double time_limit = options.get_double("time_limit");
+  const bool limited = time_limit < 1e300;  // the option's no-limit sentinel is DBL_MAX
+  Timer budget;
+  Options scaled_options = options;
+  if (limited) scaled_options.set_double("time_limit", 0.5 * time_limit);
+  Solution solution = run_engine(scaled, scaled_options);
+  const double scaled_seconds = budget.elapsed_seconds();
+  const auto note_route = [&](Solution& kept, const char* what) {
+    const std::string note =
+        limited ? fmt::format(
+                      "route: the scaled attempt returned {} after {:.1f} s of its "
+                      "{:.0f} s share; {}",
+                      to_string(solution.status), scaled_seconds, 0.5 * time_limit, what)
+                : fmt::format("route: the scaled attempt returned {}; {}",
+                              to_string(solution.status), what);
+    kept.message = kept.message.empty() ? note : kept.message + "; " + note;
+  };
+
+  // UNSCALE, AND UNSCALE EVERYTHING. A diagonal change of variable that is undone for the
+  // primal point but not for the duals produces a point that is feasible, an objective that
+  // is right, and reduced costs that are silently wrong - which passes every check the
+  // solver makes about itself and fails only against an independent verifier. The mapping is
+  // stated in src/la/scaling.hpp and derived there:
+  //
+  //     x = Dc xhat        y = Dr yhat        d = Dc^-1 dhat
+  const Index n = model.num_cols();
+  const Index m = model.num_rows();
+  for (Index j = 0; j < n; ++j) {
+    const auto u = static_cast<std::size_t>(j);
+    const double dc = scaling.column[u];
+    if (u < solution.col_value.size()) solution.col_value[u] *= dc;
+    if (u < solution.col_dual.size()) solution.col_dual[u] /= dc;
+    // A ray is a difference of primal points, so it maps exactly as a point does (#191).
+    if (u < solution.primal_ray.size()) solution.primal_ray[u] *= dc;
+  }
+  for (Index i = 0; i < m; ++i) {
+    const auto u = static_cast<std::size_t>(i);
+    if (u < solution.row_dual.size()) solution.row_dual[u] *= scaling.row[u];
+    // Farkas multipliers are row duals, and map the same way.
+    if (u < solution.farkas_dual.size()) solution.farkas_dual[u] *= scaling.row[u];
+  }
+
+  // Re-measure against the ORIGINAL model. This is the second half of the correctness
+  // argument and it is not optional: tolerances in tolerances.hpp are ABSOLUTE and stated in
+  // the original problem's units, so a point judged feasible in scaled space says nothing
+  // about the answer we return. recompute_quality rebuilds the row activities from the
+  // original matrix and recomputes the objective, so everything reported below is measured
+  // where the caller lives.
+  solution.recompute_quality(model);
+
+  // FALL BACK WHEN SCALING DOES NOT PAY. Equilibration is a heuristic: it rescues models the
+  // unscaled simplex cannot factorize at all, and on a handful of models it costs more
+  // accuracy than it buys. Measured on the Netlib medium tier, scaling alone took 26/50 to
+  // 35/50 but broke two instances that had been passing - degen2 stalled under Bland's rule
+  // and scsd6 went singular - and degraded the round-trip on our own ill_conditioned case
+  // study from 5e-20 to 1.2e-07, just over the tolerance.
+  //
+  // Rather than pick one path and lose the other's wins, take the union: if the scaled solve
+  // did not produce a point that is feasible IN ORIGINAL UNITS, solve again unscaled and
+  // keep that instead. The second solve costs nothing on the models where scaling already
+  // worked, because it never runs.
+  const double primal_tolerance = options.get_double("primal_feasibility_tolerance");
+  // The SCALED violation, to match the status decision in solve.cpp (#152). Judging this on
+  // the absolute figure meant a point the dispatcher would call feasible was retried
+  // anyway, and greenbea ran two full solves to report one answer.
+  const bool usable =
+      (solution.status == SolveStatus::kOptimal || solution.status == SolveStatus::kFeasible) &&
+      solution.primal_infeasibility_scaled <= primal_tolerance;
+  if (usable) return solution;
+
+  // THE RETRY NEVER GETS A FRESH BUDGET. An iteration limit has no notion of "remaining",
+  // so a scaled solve that hit it is reported as it stands. A time limit does: the retry
+  // gets what the scaled attempt left, which is at least half by construction above, and
+  // if the limit was somehow exhausted anyway the scaled result is reported. Measured on
+  // fit2p before this: a 60 s limit produced a 120.76 s run.
+  if (solution.status == SolveStatus::kIterationLimit) {
+    note_route(solution, "an iteration limit has no remainder, so no unscaled retry was made");
+    return solution;
+  }
+  Options retry_options = options;
+  if (limited) {
+    const double remaining = time_limit - budget.elapsed_seconds();
+    if (remaining <= 0.0) {
+      note_route(solution, "nothing was left for an unscaled retry");
+      return solution;
+    }
+    retry_options.set_double("time_limit", remaining);
+  }
+
+  logger.info("Scaled solve returned {} (primal infeasibility {:.3e}); retrying unscaled",
+              to_string(solution.status), solution.primal_infeasibility);
+  Solution unscaled = run_engine(model, retry_options);
+  const bool unscaled_usable =
+      (unscaled.status == SolveStatus::kOptimal || unscaled.status == SolveStatus::kFeasible) &&
+      unscaled.primal_infeasibility <= primal_tolerance;
+  if (unscaled_usable) {
+    logger.info("Unscaled solve succeeded where the scaled one did not");
+    note_route(unscaled, "the unscaled retry produced this answer");
+    return unscaled;
+  }
+
+  // AN UNBOUNDED CLAIM IS REPORTED ONLY WHEN BOTH ATTEMPTS MAKE IT. The two solves are a
+  // portfolio precisely because scaling changes the numerics; a claim that one of them makes
+  // and the other does not is a claim about the numerics, not about the model. Measured on
+  // maros-r7, whose optimum is published: the scaled attempt found a ray that passed its own
+  // certificate and said UNBOUNDED, the unscaled attempt said numerical error, and the
+  // tie-break below - which prefers the attempt closer to feasibility - handed the user the
+  // wrong one, because an unbounded claim has no infeasibility to speak of. Disagreement is
+  // reported as what it is: the attempt that did not claim, with the other's claim on record.
+  const bool scaled_claims = solution.status == SolveStatus::kUnbounded;
+  const bool unscaled_claims = unscaled.status == SolveStatus::kUnbounded;
+  if (scaled_claims != unscaled_claims) {
+    Solution kept = scaled_claims ? unscaled : solution;
+    const char* claimant = scaled_claims ? "scaled" : "unscaled";
+    const std::string note = fmt::format(
+        "the {} attempt claimed unbounded but the other attempt did not; the claim is "
+        "withheld and the non-claiming result is reported",
+        claimant);
+    kept.message = kept.message.empty() ? note : kept.message + "; " + note;
+    logger.warning("{}", note);
+    note_route(kept, scaled_claims ? "the unscaled retry's result is reported"
+                                   : "the scaled attempt's result is reported");
+    return kept;
+  }
+
+  // Neither worked. Report the one that came closer to feasibility, so the message the user
+  // sees describes the better of the two attempts rather than whichever ran last.
+  const bool prefer_unscaled = unscaled.primal_infeasibility < solution.primal_infeasibility;
+  Solution& closer = prefer_unscaled ? unscaled : solution;
+  note_route(closer, prefer_unscaled ? "neither attempt produced a usable point; the unscaled "
+                                       "retry came closer to feasibility and is reported"
+                                     : "neither attempt produced a usable point; the scaled "
+                                       "attempt came closer to feasibility and is reported");
+  return closer;
+}
+
+}  // namespace detail
+
+}  // namespace nirnay

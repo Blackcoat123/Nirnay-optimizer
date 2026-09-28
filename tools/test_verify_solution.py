@@ -1,0 +1,667 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Tests for verify_solution.py's MPS reader.
+
+Standalone, no test framework dependency - consistent with the rest of bench/ and tools/.
+Run directly:
+
+    python tools/test_verify_solution.py
+
+Exit codes: 0 all tests passed, 1 at least one failed.
+"""
+
+from __future__ import annotations
+
+import sys
+import tempfile
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import verify_solution as vs  # noqa: E402
+
+FAILURES = 0
+
+
+def check(condition: bool, name: str, detail: str = "") -> None:
+    global FAILURES
+    mark = "PASS" if condition else "FAIL"
+    print(f"  [{mark}] {name}" + (f"  {detail}" if detail else ""))
+    if not condition:
+        FAILURES += 1
+
+
+# =============================================================================================
+# Issue #48: a row or column name containing a space is legal fixed-format MPS. Free-format
+# tokenisation splits "DEDO3 1R" into two fields ("DEDO3", "1R"), shifting every field after it
+# left by one - on the COLUMNS line below that turns the row name "OB1PNW20" into a value field,
+# and float("OB1PNW20") raises exactly the error this issue reports. parse_mps() must retry the
+# whole file in fixed columns when free-format tokenisation fails, and recover the real names.
+#
+# These lines are built at the exact 1-based IBM column positions (2-3, 5-12, 15-22, 25-36,
+# 40-47, 50-61), the same positions FIXED_FIELDS in verify_solution.py encodes.
+# =============================================================================================
+
+FIXED_FORMAT_MPS_WITH_SPACES_IN_NAMES = """\
+NAME          FORPLAN-LIKE
+ROWS
+ N  OB1PNW20
+ E  DEDO3 1R
+COLUMNS
+    DEDO3 11  OB1PNW20  .02466         DEDO3 1R  -1.
+RHS
+    RHS1      DEDO3 1R  0.0
+ENDATA
+"""
+
+
+def test_fixed_format_row_name_with_space() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "forplan_like.mps"
+        path.write_text(FIXED_FORMAT_MPS_WITH_SPACES_IN_NAMES)
+
+        # Free-format alone must fail on this file - if it didn't, the fixture wouldn't be
+        # testing anything. This pins the bug report itself, not just the fix.
+        raised = False
+        try:
+            vs._parse_mps(path, fixed=False)
+        except ValueError:
+            raised = True
+        check(raised, "free-format tokenisation fails on this file",
+              "confirms the fixture reproduces the reported bug")
+
+        # parse_mps() is the public entry point: free-format first, fixed-column retry on
+        # failure. This must succeed and recover the names byte-for-byte, spaces included.
+        model = vs.parse_mps(path)
+        check(model.num_rows == 1, "row count", f"got {model.num_rows}, expected 1")
+        check(model.num_cols == 1, "column count", f"got {model.num_cols}, expected 1")
+        check("DEDO3 1R" in model.row_index, "row name recovered with embedded space",
+              f"row_names={model.row_names}")
+        check("DEDO3 11" in model.col_index, "column name recovered with embedded space",
+              f"col_names={model.col_names}")
+
+        if "DEDO3 11" in model.col_index:
+            col = model.col_index["DEDO3 11"]
+            check(abs(model.col_cost[col] - 0.02466) < 1e-12, "objective coefficient",
+                  f"got {model.col_cost[col]}, expected 0.02466")
+            entries = dict(model.entries[col])
+            if "DEDO3 1R" in model.row_index:
+                row = model.row_index["DEDO3 1R"]
+                check(row in entries and abs(entries[row] - (-1.0)) < 1e-12,
+                      "row coefficient", f"entries={entries}")
+
+
+# =============================================================================================
+# Reading back the quoted names that src/io/writer.cpp emits (#86).
+#
+# A fixed-format MPS name may legally contain a space - Netlib forplan has a column
+# `DEDO3 11` - and the .sol columns/rows tables are one whitespace-delimited record per line.
+# The writer double-quotes such a name, backslash-escaping a backslash or a quote inside it.
+# parse_sol has to undo exactly that, or the recovered name will not match the one the
+# independent MPS reader parsed, and the column shows up as structurally MISSING rather than
+# merely misnamed - a confusing failure a long way from its cause.
+#
+# The two readers are written from the format independently and deliberately share no code,
+# so this is the only place the pairing between them is actually checked.
+# =============================================================================================
+
+QUOTE, BACKSLASH = chr(34), chr(92)
+ESCAPED_QUOTE_NAME = "HAS" + QUOTE + "QUOTED"
+
+# Built from chr() rather than written as a literal. A quoted name containing an ESCAPED
+# quote cannot be written straightforwardly inside a Python string - the source parser
+# consumes the backslash first, so the file under test ends up with no escape in it and
+# the test silently checks the wrong thing. That happened twice while writing this.
+SOL_WITH_QUOTED_NAMES = "\n".join([
+    "# NIRNAY solution file",
+    "model QTEST",
+    "status optimal",
+    "",
+    "begin columns 2",
+    QUOTE + "DEDO3 11" + QUOTE + " 5 0 basic",
+    "PLAIN 3 0 basic",
+    "end columns",
+    "",
+    "begin rows 2",
+    QUOTE + "DEDO3 1R" + QUOTE + " 4 0.5 at_upper",
+    QUOTE + "HAS" + BACKSLASH + QUOTE + "QUOTED" + QUOTE + " 1 0 basic",
+    "end rows",
+    "",
+]) + "\n"
+
+
+
+def test_sol_reader_recovers_quoted_names() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "quoted.sol"
+        path.write_text(SOL_WITH_QUOTED_NAMES)
+        # parse_sol RAISES rather than returning something wrong when it mis-splits a
+        # record, so catch it here: an uncaught exception aborts the whole runner and every
+        # later test silently never runs, which reads as "no failures" in CI.
+        try:
+            solution = vs.parse_sol(path)
+        except Exception as error:  # noqa: BLE001 - reporting it IS the test
+            check(False, "parse_sol reads a file containing quoted names", f"raised {error!r}")
+            return
+
+        check("DEDO3 11" in solution.col_value, "quoted column name with a space recovered",
+              f"col_value keys={list(solution.col_value)}")
+        check("DEDO3 1R" in solution.row_activity, "quoted row name with a space recovered",
+              f"row_activity keys={list(solution.row_activity)}")
+        check(ESCAPED_QUOTE_NAME in solution.row_activity,
+              "backslash-escaped quote inside a name recovered",
+              f"row_activity keys={list(solution.row_activity)}")
+        check("PLAIN" in solution.col_value, "an unquoted name is unaffected",
+              f"col_value keys={list(solution.col_value)}")
+
+        if "DEDO3 11" in solution.col_value:
+            check(solution.col_value["DEDO3 11"] == 5.0, "value for the quoted column",
+                  f"got {solution.col_value.get('DEDO3 11')}")
+            check(solution.col_status["DEDO3 11"] == "basic", "status for the quoted column",
+                  f"got {solution.col_status.get('DEDO3 11')}")
+        if "DEDO3 1R" in solution.row_activity:
+            check(solution.row_dual["DEDO3 1R"] == 0.5, "dual for the quoted row",
+                  f"got {solution.row_dual.get('DEDO3 1R')}")
+
+
+def test_known_bad_solution_is_rejected() -> None:
+    """A sanity check on the pass/fail contract itself: a solution violating a bound must
+    fail verification, not pass it."""
+    model = vs.Model()
+    model.row_names = []
+    model.col_names = ["x"]
+    model.col_index = {"x": 0}
+    model.col_cost = [1.0]
+    model.col_lower = [0.0]
+    model.col_upper = [1.0]
+    model.col_integer = [False]
+    model.entries = [[]]
+
+    solution = vs.Solution()
+    solution.header = {"status": "optimal", "objective": "5.0"}
+    solution.col_value = {"x": 5.0}  # violates upper bound 1.0
+    solution.col_dual = {"x": 0.0}
+
+    report = vs.verify(model, solution, vs.DEFAULT_PRIMAL_TOL, vs.DEFAULT_DUAL_TOL,
+                       vs.DEFAULT_INTEGER_TOL, vs.DEFAULT_DUALITY_TOL)
+    check(report.failures > 0, "bound-violating solution is rejected",
+          f"{report.failures} check(s) failed, as expected")
+
+
+def _one_row_lp(cost, lower, upper, row_lower, row_upper, entries) -> "vs.Model":
+    """A one-row LP with columns x0, x1, ... and row r0."""
+    model = vs.Model()
+    model.name = "ACCOUNTING"
+    model.col_names = [f"x{j}" for j in range(len(cost))]
+    model.col_index = {name: j for j, name in enumerate(model.col_names)}
+    model.col_cost = list(cost)
+    model.col_lower = list(lower)
+    model.col_upper = list(upper)
+    model.col_integer = [False] * len(cost)
+    model.row_names = ["r0"]
+    model.row_index = {"r0": 0}
+    model.row_lower = [row_lower]
+    model.row_upper = [row_upper]
+    model.entries = [[(0, a)] for a in entries]
+    return model
+
+
+def _certificate(model, x, d, y) -> "vs.Solution":
+    solution = vs.Solution()
+    activity = sum(entries[0][1] * v for entries, v in zip(model.entries, x))
+    solution.header = {"status": "optimal",
+                       "objective": repr(sum(c * v for c, v in zip(model.col_cost, x)))}
+    solution.col_value = dict(zip(model.col_names, x))
+    solution.col_dual = dict(zip(model.col_names, d))
+    solution.row_activity = {"r0": activity}
+    solution.row_dual = {"r0": y}
+    return solution
+
+
+def _strong_duality(report):
+    """The (ok, name, detail) record of the strong-duality check."""
+    return next(line for line in report.lines if line[1] == "strong duality")
+
+
+def test_strong_duality_still_rejects_a_reduced_cost_pricing_the_wrong_bound() -> None:
+    """Netlib recipe (#157) at unit scale. x0 + x1 = 0 with both columns in [0, 20] forces
+    both to their lower bounds, so the point is optimal for any costs; with costs (1, 2)
+    the row price must satisfy y <= 1. y = 1.004 gives d0 = -0.004: a column at its LOWER
+    bound with a reduced cost that prices the UPPER bound, 20 away. The sign check passes
+    (both bounds exist), complementarity passes (nearest slack 0), consistency passes (d
+    is exactly c - A^T y). Only strong duality sees the 0.08, and the accounting must not
+    explain it away: a multiplier above the tolerance explains its share of the gap only
+    up to the nearest slack, which is zero."""
+    model = _one_row_lp(cost=[1.0, 2.0], lower=[0.0, 0.0], upper=[20.0, 20.0],
+                        row_lower=0.0, row_upper=0.0, entries=[1.0, 1.0])
+    solution = _certificate(model, x=[0.0, 0.0], d=[1.0 - 1.004, 2.0 - 1.004], y=1.004)
+    report = vs.verify(model, solution, vs.DEFAULT_PRIMAL_TOL, vs.DEFAULT_DUAL_TOL,
+                       vs.DEFAULT_INTEGER_TOL, vs.DEFAULT_DUALITY_TOL)
+    ok, _, detail = _strong_duality(report)
+    check(report.failures == 1 and not ok,
+          "a wrong-bound reduced cost fails strong duality and nothing else", detail)
+
+
+def test_strong_duality_accepts_a_gap_made_of_accepted_per_item_violations() -> None:
+    """Netlib etamacro at unit scale. min x0 - 5e-8 x1 s.t. x0 + x1 >= 40, x0 in [0, 20],
+    x1 in [40, 100]. The certificate x = (0, 40), y = 0, d = c is exactly consistent, and
+    d1 = -5e-8 is half the dual tolerance: the sign check accepts it (both bounds exist)
+    and complementarity is 0 (x1 sits at a bound). The true optimum is x1 = 100, better by
+    3e-6 - which is what a reduced cost the dual tolerance calls zero, on a range of 60,
+    can hide. The old aggregate test rejected this at a relative gap of 2e-6 against 1e-9,
+    tighter than the per-item tolerance that had just accepted the cause. The gap is now
+    accounted for by that accepted item."""
+    model = _one_row_lp(cost=[1.0, -5e-8], lower=[0.0, 40.0], upper=[20.0, 100.0],
+                        row_lower=40.0, row_upper=vs.INF, entries=[1.0, 1.0])
+    solution = _certificate(model, x=[0.0, 40.0], d=[1.0, -5e-8], y=0.0)
+    report = vs.verify(model, solution, vs.DEFAULT_PRIMAL_TOL, vs.DEFAULT_DUAL_TOL,
+                       vs.DEFAULT_INTEGER_TOL, vs.DEFAULT_DUALITY_TOL)
+    check(report.failures == 0, "accepted per-item violations account for the gap",
+          "; ".join(f"{name}: {detail}" for ok, name, detail in report.lines if not ok)
+          or _strong_duality(report)[2])
+
+
+QPS_WITH_OFF_DIAGONAL = """NAME          QCONV
+ROWS
+ N  COST
+ G  R1
+COLUMNS
+    X         COST        -1.0   R1           1.0
+    Y         COST        -1.0   R1           1.0
+RHS
+    RHS       R1           0.0
+BOUNDS
+ FR BND       X
+ FR BND       Y
+QUADOBJ
+    X         X            2.0
+    X         Y            1.0
+    Y         Y            2.0
+ENDATA
+"""
+
+
+def test_qps_convention_is_read_as_qps_means_it() -> None:
+    """The 0.5 / lower-triangle convention, pinned on the EVALUATED objective.
+
+    QPS states the objective as c'x + 0.5 x'Qx and lists only the lower triangle of the
+    symmetric Q, so a stored off-diagonal stands for TWO entries of Q. The two ways to get
+    this wrong - halving the off-diagonal, or mirroring it into both triangles - both produce
+    a script that reads the file back plausibly and then certifies the solver's answer to a
+    DIFFERENT problem. Checking a stored number would not catch either; checking the value of
+    the objective at a known point does.
+
+    Q = [[2, 1], [1, 2]], c = (-1, -1). At x = (1, 1):
+        c'x        = -2
+        0.5 x'Qx   = 0.5 * (2 + 1 + 1 + 2) = 3
+        objective  = 1
+    A mirrored reading gives 4 for the quadratic term; a halved one gives 2.5.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "qconv.qps"
+        path.write_text(QPS_WITH_OFF_DIAGONAL)
+        model = vs.parse_mps(path)
+
+        check(len(model.hessian) == 3, "three Hessian entries stored",
+              f"got {len(model.hessian)}")
+        check(model.hessian.get((1, 0)) == 1.0, "the off-diagonal is stored lower-triangular",
+              f"hessian={model.hessian}")
+
+        x = [1.0, 1.0]
+        quadratic = model.quadratic_objective(x)
+        check(abs(quadratic - 3.0) < 1e-12, "0.5 x'Qx at (1, 1)",
+              f"got {quadratic}, expected 3.0 (4.0 would mean mirrored, 2.5 halved)")
+
+        # Qx = (2*1 + 1*1, 1*1 + 2*1) = (3, 3). This is the gradient term every KKT check
+        # below depends on, so it is pinned separately from the objective.
+        qx = model.hessian_times(x)
+        check(qx == [3.0, 3.0], "Qx expands the stored triangle symmetrically", f"got {qx}")
+
+
+def test_qp_optimum_verifies_and_a_wrong_one_does_not() -> None:
+    """The KKT conditions, on the QP above, at the true optimum and at a near miss.
+
+    min -x - y + 0.5(2x^2 + 2xy + 2y^2)  s.t. x + y >= 0, x and y free.
+    Gradient c + Qx vanishes where 2x + y = 1 and x + 2y = 1, i.e. x = y = 1/3. The row is
+    then slack (2/3 > 0) so its multiplier is zero, and the objective is -1/3.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "qconv.qps"
+        path.write_text(QPS_WITH_OFF_DIAGONAL)
+        model = vs.parse_mps(path)
+
+        third = 1.0 / 3.0
+        solution = vs.Solution()
+        solution.header = {"status": "optimal", "objective": repr(-third)}
+        solution.col_value = {"X": third, "Y": third}
+        solution.col_status = {"X": "basic", "Y": "basic"}
+        solution.col_dual = {"X": 0.0, "Y": 0.0}
+        solution.row_activity = {"R1": 2.0 * third}
+        solution.row_dual = {"R1": 0.0}
+
+        report = vs.verify(model, solution, vs.DEFAULT_PRIMAL_TOL, vs.DEFAULT_DUAL_TOL,
+                           vs.DEFAULT_INTEGER_TOL, vs.DEFAULT_DUALITY_TOL)
+        check(report.failures == 0, "the true QP optimum verifies",
+              f"{report.failures} check(s) failed")
+
+        # A point that is primal FEASIBLE and whose objective is reported consistently, but
+        # which is not stationary. Only the quadratic-aware KKT checks can tell the two
+        # apart - to an LP-shaped verifier this point looks exactly as good as the optimum.
+        objective = -1.0 + 0.5 * (2.0 + 2.0 * 0.5 + 2.0 * 0.25)
+        near_miss = vs.Solution()
+        near_miss.header = {"status": "optimal", "objective": repr(objective)}
+        near_miss.col_value = {"X": 1.0, "Y": 0.5}
+        near_miss.col_status = {"X": "basic", "Y": "basic"}
+        near_miss.col_dual = {"X": 0.0, "Y": 0.0}
+        near_miss.row_activity = {"R1": 1.5}
+        near_miss.row_dual = {"R1": 0.0}
+
+        report = vs.verify(model, near_miss, vs.DEFAULT_PRIMAL_TOL, vs.DEFAULT_DUAL_TOL,
+                           vs.DEFAULT_INTEGER_TOL, vs.DEFAULT_DUALITY_TOL)
+        check(report.failures > 0, "a feasible non-stationary point is rejected",
+              f"{report.failures} check(s) failed, as expected")
+
+
+QPS_MAXIMIZE = """NAME          QMAX
+OBJSENSE
+    MAX
+ROWS
+ N  COST
+ L  R1
+COLUMNS
+    X         COST         4.0   R1           1.0
+RHS
+    RHS       R1          10.0
+BOUNDS
+ FR BND       X
+QUADOBJ
+    X         X           -2.0
+ENDATA
+"""
+
+
+def test_quadratic_maximization_keeps_its_sign() -> None:
+    """The sign path, which is where a quadratic objective is easiest to get wrong.
+
+    Every KKT check runs in MINIMIZE space, reached by multiplying through by sigma. The
+    linear cost was already handled that way; the quadratic term has to follow it, and it
+    enters in two places - the gradient c + Qx, and the -0.5 x'Qx the Dorn dual subtracts.
+    Miss sigma on either and a maximization QP is checked against the conditions for its
+    negation, which rejects correct answers and, on a symmetric enough instance, accepts
+    wrong ones.
+
+    max 4x - x^2  s.t. x <= 10, x free. Stored as c = 4 and Q = -2, since the file's
+    objective is c'x + 0.5 x'Qx. The gradient 4 - 2x vanishes at x = 2, the row is slack
+    there (2 < 10) so its multiplier is zero, and the objective is 8 - 4 = 4.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "qmax.qps"
+        path.write_text(QPS_MAXIMIZE)
+        model = vs.parse_mps(path)
+
+        check(model.maximize, "OBJSENSE MAX survives the quadratic section", "")
+        check(model.hessian == {(0, 0): -2.0}, "negative Hessian stored as written",
+              f"got {model.hessian}")
+
+        optimum = vs.Solution()
+        optimum.header = {"status": "optimal", "objective": "4.0"}
+        optimum.col_value = {"X": 2.0}
+        optimum.col_status = {"X": "basic"}
+        optimum.col_dual = {"X": 0.0}
+        optimum.row_activity = {"R1": 2.0}
+        optimum.row_dual = {"R1": 0.0}
+
+        report = vs.verify(model, optimum, vs.DEFAULT_PRIMAL_TOL, vs.DEFAULT_DUAL_TOL,
+                           vs.DEFAULT_INTEGER_TOL, vs.DEFAULT_DUALITY_TOL)
+        check(report.failures == 0, "the true maximum verifies",
+              f"{report.failures} check(s) failed")
+
+        # x = 3 is feasible and its objective is reported correctly (12 - 9 = 3). It is
+        # simply not the maximum. Only a check that knows the gradient is 4 - 2x can say so.
+        near_miss = vs.Solution()
+        near_miss.header = {"status": "optimal", "objective": "3.0"}
+        near_miss.col_value = {"X": 3.0}
+        near_miss.col_status = {"X": "basic"}
+        near_miss.col_dual = {"X": 0.0}
+        near_miss.row_activity = {"R1": 3.0}
+        near_miss.row_dual = {"R1": 0.0}
+
+        report = vs.verify(model, near_miss, vs.DEFAULT_PRIMAL_TOL, vs.DEFAULT_DUAL_TOL,
+                           vs.DEFAULT_INTEGER_TOL, vs.DEFAULT_DUALITY_TOL)
+        check(report.failures > 0, "a feasible non-maximal point is rejected",
+              f"{report.failures} check(s) failed, as expected")
+
+
+# =========================================================================================
+# The two verdicts that have no point of their own (#191)
+# =========================================================================================
+
+
+def _two_row_lp(cost, lower, upper, rows) -> "vs.Model":
+    """Columns x0.., rows r0.. Each row is (row_lower, row_upper, [coefficients])."""
+    model = vs.Model()
+    model.name = "VERDICT"
+    model.col_names = [f"x{j}" for j in range(len(cost))]
+    model.col_index = {name: j for j, name in enumerate(model.col_names)}
+    model.col_cost = list(cost)
+    model.col_lower = list(lower)
+    model.col_upper = list(upper)
+    model.col_integer = [False] * len(cost)
+    model.row_names = [f"r{i}" for i in range(len(rows))]
+    model.row_index = {name: i for i, name in enumerate(model.row_names)}
+    model.row_lower = [r[0] for r in rows]
+    model.row_upper = [r[1] for r in rows]
+    model.entries = [[(i, rows[i][2][j]) for i in range(len(rows)) if rows[i][2][j] != 0.0]
+                     for j in range(len(cost))]
+    return model
+
+
+def _verdict(status, header=None, columns=None, rows=None, farkas=None, ray=None):
+    solution = vs.Solution()
+    solution.header = {"status": status, "objective": "0.0"}
+    solution.header.update(header or {})
+    for name, value in (columns or {}).items():
+        solution.col_value[name] = value
+        solution.col_dual[name] = 0.0
+    for name, value in (rows or {}).items():
+        solution.row_activity[name] = value
+        solution.row_dual[name] = 0.0
+    solution.farkas = dict(farkas or {})
+    solution.ray = dict(ray or {})
+    return solution
+
+
+def _run(model, solution):
+    return vs.verify(model, solution, vs.DEFAULT_PRIMAL_TOL, vs.DEFAULT_DUAL_TOL,
+                     vs.DEFAULT_INTEGER_TOL, vs.DEFAULT_DUALITY_TOL)
+
+
+def _contradictory_pair() -> "vs.Model":
+    """x >= 5 and x <= 2. Needs both rows, so a one-row certificate cannot express it."""
+    return _two_row_lp(cost=[1.0], lower=[0.0], upper=[vs.INF],
+                       rows=[(5.0, vs.INF, [1.0]), (-vs.INF, 2.0, [1.0])])
+
+
+def test_a_valid_farkas_certificate_verifies() -> None:
+    """Adding row 0 and subtracting row 1 gives 0 >= 3, which nothing satisfies."""
+    report = _run(_contradictory_pair(),
+                  _verdict("infeasible", farkas={"r0": 1.0, "r1": -1.0}))
+    check(report.failures == 0, "a valid Farkas certificate verifies",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines if not ok))
+
+
+def test_a_weakened_farkas_certificate_is_rejected() -> None:
+    """The control. Shrink one multiplier and the aggregate stops contradicting anything -
+    it becomes 0.8x >= 4.6, which x can satisfy because x has no upper bound."""
+    report = _run(_contradictory_pair(),
+                  _verdict("infeasible", farkas={"r0": 1.0, "r1": -0.2}))
+    check(report.failures >= 1, "a weakened Farkas certificate is rejected",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines))
+
+
+def test_an_infeasible_verdict_without_a_certificate_is_not_a_failure() -> None:
+    """THE BUG #191 IS ABOUT. Presolve proves infeasibility by bound arithmetic and keeps no
+    Farkas vector. Before this, the checker read the all-zero point such a file used to carry,
+    found it violated the rows, and printed REJECTED at a correct answer."""
+    report = _run(_contradictory_pair(),
+                  _verdict("infeasible", header={"certificate": "none",
+                                                 "message": "proved during presolve"}))
+    check(report.failures == 0, "an infeasible verdict with no certificate is not rejected",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines if not ok))
+
+
+def test_a_header_that_promises_a_certificate_must_carry_one() -> None:
+    """The other direction: a file that SAYS it has a proof and does not is broken."""
+    report = _run(_contradictory_pair(),
+                  _verdict("infeasible", header={"certificate": "farkas"}))
+    check(report.failures == 1, "a promised certificate that is missing is a failure",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines))
+
+
+def _open_below() -> "vs.Model":
+    """min -x subject to x >= 1, x free above."""
+    return _two_row_lp(cost=[-1.0], lower=[-vs.INF], upper=[vs.INF],
+                       rows=[(1.0, vs.INF, [1.0])])
+
+
+def test_a_valid_ray_with_a_feasible_point_verifies() -> None:
+    report = _run(_open_below(),
+                  _verdict("unbounded", header={"certificate": "ray", "objective": "-1.0"},
+                           columns={"x0": 1.0}, rows={"r0": 1.0}, ray={"x0": 1.0}))
+    check(report.failures == 0, "a valid ray verifies",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines if not ok))
+
+
+def test_a_ray_pointing_the_wrong_way_is_rejected() -> None:
+    """The control. Reversing the ray both worsens the objective and crosses the row bound,
+    so it must fail on its own merits rather than on the status."""
+    report = _run(_open_below(),
+                  _verdict("unbounded", header={"certificate": "ray", "objective": "-1.0"},
+                           columns={"x0": 1.0}, rows={"r0": 1.0}, ray={"x0": -1.0}))
+    check(report.failures >= 1, "a reversed ray is rejected",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines))
+
+
+def test_a_ray_from_an_infeasible_point_is_rejected() -> None:
+    """Unbounded is TWO claims. A ray that starts outside the feasible region proves nothing,
+    and the point is checked before the ray is even looked at."""
+    report = _run(_open_below(),
+                  _verdict("unbounded", header={"certificate": "ray", "objective": "0.0"},
+                           columns={"x0": 0.0}, rows={"r0": 0.0}, ray={"x0": 1.0}))
+    check(report.failures >= 1, "a ray from an infeasible point is rejected",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines))
+
+
+def test_a_verdict_that_claims_no_point_is_not_checked_as_if_it_did() -> None:
+    """#200. #191 fixed this for `infeasible` by naming that one status, so every other
+    verdict with nothing to show kept the bug: a numerical failure was written as a full
+    all-zero point and this script printed REJECTED at an answer the solver never made."""
+    model = _open_below()
+    report = _run(model, _verdict("numerical_error",
+                                  header={"certificate": "none",
+                                          "message": "the basis went singular"}))
+    check(report.failures == 0, "a numerical failure is not rejected for having no point",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines if not ok))
+
+
+def test_a_limit_is_checked_on_what_it_claims_not_on_feasibility() -> None:
+    """A limit says only where the solve stopped. An interior-point iterate stopped by the
+    clock approaches feasibility from OUTSIDE, so holding it to a feasibility standard tests
+    something nobody asserted. What it does claim is the primal_infeasibility in its own
+    header, and that number has to be true."""
+    model = _open_below()  # min -x subject to x >= 1
+    # x = 0 violates the row by 1.0, and the file says so.
+    solution = _verdict("time_limit",
+                        header={"objective": "0.0", "primal_infeasibility": "1.0"},
+                        columns={"x0": 0.0}, rows={"r0": 0.0})
+    report = _run(model, solution)
+    check(report.failures == 0, "a limit that states its own infeasibility verifies",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines if not ok))
+
+
+def test_a_limit_that_understates_its_infeasibility_is_rejected() -> None:
+    """The control, and the failure a solver has an incentive to make. Same point, same
+    violation, but the file claims to be a thousand times closer to feasible than it is."""
+    model = _open_below()
+    solution = _verdict("time_limit",
+                        header={"objective": "0.0", "primal_infeasibility": "1e-9"},
+                        columns={"x0": 0.0}, rows={"r0": 0.0})
+    report = _run(model, solution)
+    check(report.failures >= 1, "an understated infeasibility is rejected",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines))
+
+
+def test_interrupted_is_treated_exactly_like_a_time_limit() -> None:
+    """#223. A SolveControl stop is not a weaker verdict than a clock stopping the same
+    solve - it claims exactly the same thing a time limit does (an iterate or incumbent in
+    hand, feasibility not asserted) and is checked exactly the same way. Same model, same
+    numbers, same expected outcome as test_a_limit_is_checked_on_what_it_claims_not_on_
+    feasibility above; only the status word differs."""
+    model = _open_below()  # min -x subject to x >= 1
+    solution = _verdict("interrupted",
+                        header={"objective": "0.0", "primal_infeasibility": "1.0"},
+                        columns={"x0": 0.0}, rows={"r0": 0.0})
+    report = _run(model, solution)
+    check(report.failures == 0, "an interrupted solve that states its own infeasibility verifies",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines if not ok))
+
+    # The control: understating it must still be rejected, exactly as for time_limit.
+    understated = _verdict("interrupted",
+                           header={"objective": "0.0", "primal_infeasibility": "1e-9"},
+                           columns={"x0": 0.0}, rows={"r0": 0.0})
+    understated_report = _run(model, understated)
+    check(understated_report.failures >= 1,
+          "an interrupted solve that understates its infeasibility is rejected",
+          "; ".join(f"{n}: {d}" for ok, n, d in understated_report.lines))
+
+
+def test_an_optimal_answer_is_still_held_to_feasibility() -> None:
+    """The other control. The relaxation above must not have loosened the case that matters:
+    `optimal` asserts a feasible point, and an infeasible one is still a failure."""
+    model = _open_below()
+    solution = _verdict("optimal",
+                        header={"objective": "0.0", "primal_infeasibility": "1.0"},
+                        columns={"x0": 0.0}, rows={"r0": 0.0})
+    report = _run(model, solution)
+    check(report.failures >= 1, "an infeasible point called optimal is still rejected",
+          "; ".join(f"{n}: {d}" for ok, n, d in report.lines))
+
+
+def main() -> int:
+    print("test_fixed_format_row_name_with_space")
+    test_fixed_format_row_name_with_space()
+    print("test_sol_reader_recovers_quoted_names")
+    test_sol_reader_recovers_quoted_names()
+    print("test_known_bad_solution_is_rejected")
+    test_known_bad_solution_is_rejected()
+    test_strong_duality_still_rejects_a_reduced_cost_pricing_the_wrong_bound()
+    test_strong_duality_accepts_a_gap_made_of_accepted_per_item_violations()
+    print("test_qps_convention_is_read_as_qps_means_it")
+    test_qps_convention_is_read_as_qps_means_it()
+    print("test_qp_optimum_verifies_and_a_wrong_one_does_not")
+    test_qp_optimum_verifies_and_a_wrong_one_does_not()
+    print("test_quadratic_maximization_keeps_its_sign")
+    test_quadratic_maximization_keeps_its_sign()
+    print("the two verdicts with no point (#191)")
+    test_a_valid_farkas_certificate_verifies()
+    test_a_weakened_farkas_certificate_is_rejected()
+    test_an_infeasible_verdict_without_a_certificate_is_not_a_failure()
+    test_a_header_that_promises_a_certificate_must_carry_one()
+    test_a_valid_ray_with_a_feasible_point_verifies()
+    test_a_ray_pointing_the_wrong_way_is_rejected()
+    test_a_ray_from_an_infeasible_point_is_rejected()
+    print("verdicts that claim no point, and limits checked on honesty (#200)")
+    test_a_verdict_that_claims_no_point_is_not_checked_as_if_it_did()
+    test_a_limit_is_checked_on_what_it_claims_not_on_feasibility()
+    test_a_limit_that_understates_its_infeasibility_is_rejected()
+    test_interrupted_is_treated_exactly_like_a_time_limit()
+    test_an_optimal_answer_is_still_held_to_feasibility()
+    print()
+    if FAILURES == 0:
+        print("ALL TESTS PASSED")
+        return 0
+    print(f"{FAILURES} check(s) FAILED")
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

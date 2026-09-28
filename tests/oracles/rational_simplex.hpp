@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: Apache-2.0
+// NIRNAY - exact simplex over the rationals. TESTS ONLY.
+//
+// This is the standard the floating-point simplex is judged against, so it is written for
+// transparency rather than speed: a full dense tableau, reduced costs recomputed from
+// scratch every iteration, and Bland's rule throughout. Bland's rule is slow and it is the
+// point - it is the only pivoting rule with a termination PROOF, so the oracle cannot cycle
+// and cannot need a tolerance to decide it has finished. There are no tolerances anywhere in
+// this file; every comparison is exact.
+//
+// The instance form is deliberately narrow:
+//
+//     min c'x   subject to   A x >= b,   0 <= x <= u   (u_j optionally infinite)
+//
+// Narrow because the conversion to the standard form the tableau needs must be obviously
+// correct by inspection: one surplus variable per row, one slack per finite upper bound.
+// A richer form would need a transformation with enough moving parts to hide a bug, and a
+// buggy oracle is worse than no oracle - it manufactures confidence.
+#pragma once
+
+#include <cstdint>
+#include <vector>
+
+#include "nirnay/model.hpp"
+
+#include "oracles/rational.hpp"
+
+namespace nirnay::oracle {
+
+/// No upper bound on a column.
+inline constexpr std::int64_t kNoUpperBound = std::numeric_limits<std::int64_t>::max();
+
+/// A generated instance. Coefficients are integers so that the exact arithmetic starts from
+/// small numbers and overflow stays rare.
+struct GeneratedLp {
+  Index num_rows = 0;
+  Index num_cols = 0;
+  /// Row-major, num_rows x num_cols.
+  std::vector<std::vector<std::int64_t>> a;
+  /// Row lower bounds: A x >= b.
+  std::vector<std::int64_t> b;
+  /// Per-column lower bound. Empty means all zero, which is what the generators produce;
+  /// the exact branch and bound fills it in as it tightens.
+  std::vector<std::int64_t> lower;
+  /// Per-column integrality. Empty means every column is continuous.
+  std::vector<char> integral;
+  /// Objective coefficients, minimized.
+  std::vector<std::int64_t> c;
+  /// Per-column upper bound, or kNoUpperBound.
+  std::vector<std::int64_t> upper;
+
+  /// A human-readable dump, used when the fuzz harness reports a mismatch. A failing
+  /// instance nobody can reproduce is not evidence.
+  [[nodiscard]] std::string to_text() const;
+};
+
+/// Build the nirnay::Model that represents exactly the same instance, so the float solver
+/// and the oracle see one problem and not two.
+[[nodiscard]] Model to_model(const GeneratedLp& lp);
+
+enum class OracleStatus {
+  kOptimal,
+  kInfeasible,
+  kUnbounded,
+  /// Exact arithmetic exceeded __int128. The instance is discarded and counted, never
+  /// silently treated as agreement.
+  kOverflow,
+  kIterationLimit
+};
+
+[[nodiscard]] const char* to_string(OracleStatus status) noexcept;
+
+struct OracleResult {
+  OracleStatus status = OracleStatus::kOptimal;
+  Rational objective;
+  std::vector<Rational> x;
+  std::int64_t iterations = 0;
+};
+
+/// Solve exactly. Never throws: RationalOverflow becomes kOverflow.
+[[nodiscard]] OracleResult solve_exact(const GeneratedLp& lp);
+
+/// Solve the MIXED-INTEGER problem exactly, by branch and bound over solve_exact().
+///
+/// Every bound is an integer and every LP is solved in exact arithmetic, so there is no
+/// tolerance anywhere and no possibility of a node being fathomed on a rounding error. This
+/// is the standard the floating-point branch and bound is judged against, in the same way
+/// solve_exact() is the standard for the simplex.
+///
+/// `node_limit` caps the search; hitting it yields kIterationLimit rather than a wrong
+/// answer, and the fuzz harness counts those separately.
+[[nodiscard]] OracleResult solve_exact_milp(const GeneratedLp& lp, std::int64_t node_limit);
+
+}  // namespace nirnay::oracle

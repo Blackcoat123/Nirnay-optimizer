@@ -1,0 +1,272 @@
+**SIH26119** — Indigenous GPU-Accelerated Optimization Solver (Sovereign Alternative to CPLEX / Xpress)  
+Smart India Hackathon 2026 · Mangalore Refinery and Petrochemicals Limited (MRPL)
+
+# NIRNAY
+
+**Indigenous GPU-accelerated optimization solver — LP, MILP, convex QP, written from
+mathematical foundations.**
+
+Smart India Hackathon 2026, problem statement **SIH26119**, issued by Mangalore Refinery and
+Petrochemicals Limited.
+
+> Not built on top of any open-source solver. See [`docs/PROVENANCE.md`](docs/PROVENANCE.md)
+> for the dependency table, the full link line, the linked-library dump, and the CI job that
+> fails the build if a solver library ever appears in the binary.
+
+---
+
+## Status
+
+| Phase | Scope | State |
+|---|---|---|
+| 1 | Foundations: model, options, sparse linear algebra, CI | **done** |
+| 2 | MPS/LP readers, revised primal simplex, CLI | **done** |
+| 3 | Verification spine: rational oracle, independent checker, Netlib harness | **done** |
+| 4 | Restarted PDHG — **CPU done**, its answer finished by the interior point by default since #229; CUDA backend not started (no GPU available) | partial |
+| 5 | Branch & bound → MILP | **done** (MIPLIB benchmarked; root cuts landed in #159 and are off by default, see below) |
+| 6–10 | Performance, branch & cut, IPM/QP, robustness, packaging | convex QP **done** (Phase 8, `src/qp/`); interior point **done, opt-in** (`src/ipm/`, no basis); robustness sweep **done** (`bench/runners/robustness.py`); root cuts **done, off by default** (#159, `src/mip/cuts.cpp`); machine-checkable certificates for infeasible and unbounded models **done** (#192, `src/core/certificate.cpp`, checked by `tools/verify_solution.py`); MIP gap targets **done** (#188); packaging **done** apart from the human items on #73 |
+
+LP is solved by a bounded-variable revised primal simplex (or restarted PDHG), MILP by
+branch and bound, and convex QP by a Condat-Vu primal-dual method — and MIQP by branch and
+bound over QP relaxations — all end to end from an MPS file through to an independently
+verified answer. **Non-convex** QP is the one class still refused, and refused deliberately
+rather than approximated: it is decided by an LDL^T semidefiniteness test before any
+arithmetic starts, and a negative pivot is returned as the certificate. Reporting a local
+optimum as a global one is the single most damaging thing this dispatcher could do, so it
+does not — see the evidence rules in [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md).
+
+Benchmark results against Netlib, headline first: **78 of 89** on the full set — matched
+to the published optimum to a relative 1e-6 *and* passed independent verification —
+measured on `main` at `53cbe16` (`bench/results/netlib-full-53cbe16.csv`). The narrower
+tiers read higher (**48 of 50** on the medium tier, **9 of 9** on the small set the demo
+runs) because both are defined by a row cap, which makes them the easier half by
+construction; the full set is the number Phase 6's ">= 95% of Netlib" criterion is
+measured against, so it is the one quoted here. See
+[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md), generated from the CSVs in `bench/results/` so
+it cannot drift.
+
+The 11 non-passes are worth naming, and most of them are not wrong answers. Every one that
+produces an answer was cross-checked against **HiGHS**, a mature third-party solver run as a
+separate process, by `bench/runners/cross_check_highs.py`
+(`bench/results/cross-check-highs-adcee1b.csv`):
+
+| what it is | count | instances |
+|---|---|---|
+| our answer verifies as optimal and agrees with HiGHS; Netlib's published table is the outlier (`e226` by its objective constant, the rest by up to 1.3e-03) | **7** | `80bau3b`, `e226`, `ganges`, `greenbea`, `greenbeb`, `nesm`, `scrs8` |
+| ran out of time at 120 s | **2** | `dfl001`, `pilot87` |
+| the answer agrees with HiGHS to 3.0e-07 and verifies; our own dual-feasibility check downgrades the status to `feasible`, and Netlib's table is off by 1.5e-04 | **1** | `pilot` |
+| the solver declined to answer: its phase-1 ratio test found no blocking variable and it reported a numerical error rather than a claim it could not stand behind | **1** | `maros-r7` |
+
+So: **on every Netlib instance where this solver produces a final answer, that answer
+agrees with HiGHS** - nine of the twelve rows in that CSV agree to 3.0e-07 or better. The
+three that differ are `dfl001` and `pilot87`, whose rows there are unfinished iterates
+rather than answers, and `maros-r7`, which has none. What remains is speed on two
+instances, our own status reporting on one, and one instance without an answer.
+
+The machine's speed state is part of the evidence, so it is stated, and on this laptop it
+decides exactly one instance. `pilot87` needs **26,226 iterations** to reach its optimum -
+run it under `--option iteration_limit=27000` and it gets there every time, at objective
+301.710691459, with one basis repair - and whether those iterations fit inside the 120 s
+limit depends on how fast the machine is that minute. It fitted at `adcee1b` (55.9 s) and
+did not at `53cbe16` (the run above), which is the whole of the difference between 79 of
+89 and 78 of 89 on this hardware. Nothing else moves: 86 of the 89 rows are identical in
+status, iteration count and objective between the two runs, and the other two are
+`dfl001`, truncated wherever the clock leaves it, and `fit2p`, which takes the scaled or
+the unscaled route depending on the same clock (#172). The table above is the slower, more
+conservative run.
+
+This mattered because our own verifier could not settle it — it re-derives the answer from
+the same file we read, so agreeing with it shows only that our two readers agree, and both
+were written by this project (#75). Two independent solvers landing on the same number is a
+different order of evidence. The pass rate above is still measured against Netlib's table,
+unchanged: a project cannot grade itself against a solver of its own choosing.
+
+The failure class that *was* the largest is gone from Netlib. `basis became singular` was
+13 of 23 failures at `ca6fde9` (`bench/results/netlib-full-ca6fde9.csv`, 2026-08-31) and
+has been **zero on the full Netlib set** since #144 found the pivot search treating "none
+of my first four candidates was admissible" as proof of singularity and #147 repaired the
+genuine rank defects that remained. It is not zero everywhere: on Mittelmann's `qap15` the
+unscaled retry went singular at iteration 13,954 (`bench/results/mittelmann-592aea3.csv`,
+issue #174), the first reappearance in the evidence and on the Mittelmann instance closest
+to Netlib's size. Since then the dual simplex became the automatic engine (#165),
+reliability branching landed (#166), presolve's postsolve runs its dual passes to a fixed
+point (#162), and the FTRAN went hyper-sparse (#169): between them the full set went from
+71 to 78 verified passes, and `degen3`, which took 123.6 s, takes 0.9 s
+(`bench/results/netlib-full-53cbe16.csv`).
+
+That is a better class of problem to have, and a different roadmap: speed on the three
+largest instances rather than robustness. Tracked in #214 (the four non-passes that are
+ours to fix) and #210 (the dual simplex's iteration rate at size).
+
+MIPLIB 2017 is benchmarked too: **13 of 30** easy instances reach the published optimum,
+**9 of 30** also prove it (`bench/results/miplib-f7ca7e9.csv`, 60 s; it was 6 of 30 at
+`53cbe16`, before #188 let a search that meets its gap target say `optimal` - three of the
+nine are that renamed status, not a better search) - branch and bound has reliability
+branching and warm-started node LPs, and root cutting planes that are off by default: on the
+same commit they prove the same nine, take the node count to 0.918x, and cost one published
+match (`noswot`'s incumbent worsens from -41 to -39 with them on; `bench/results/miplib-
+cuts-{off,on}.csv`, `docs/BENCHMARKS.md` section 2), so it finds good incumbents far more
+often than it closes the bound. For
+scale beyond what Netlib tests, `bench/runners/generate_large_lp.py` builds sparse LPs of
+any size with an exactly known analytic optimum, and `bench/runners/mittelmann.py` runs
+Mittelmann's LP set: on its eight smallest instances (6,330 to 376,500 rows) the result is
+**0 of 8** inside 300 s - eight time limits, now that `qap15` no longer ends in a singular
+basis (#174, fixed in #178) - every one named in section 1d of `docs/BENCHMARKS.md`
+(`bench/results/mittelmann-f7ca7e9.csv`, run on `main`, on AC, alone on the machine). The
+overrun on `bdry2`, whose time limit cannot reach inside the sparse LU (#208), is 380 s
+against 300 where it was 648.
+
+## Reproduce everything
+
+One command takes a fresh clone to every claim on this page - build, tests, the Netlib
+benchmark with independent verification, the HiGHS comparison, and the full PS26119
+walkthrough:
+
+```bash
+scripts/reproduce.sh
+```
+
+It runs **offline**: the Netlib instances it benchmarks are committed, with their published
+optima. Add `--fetch-medium` to also download and run the 50-instance medium tier; the
+full 89-instance set, where the headline number above comes from, is
+`bench/runners/fetch_data.py --set full` followed by
+`bench/runners/netlib.py --time-limit 120`. Any step that cannot run on your machine prints why and is
+listed again in the summary, so a shorter run is never mistaken for a passing one.
+
+To check the machine without running anything:
+
+```bash
+scripts/preflight.sh
+```
+
+It names the two things that most often go wrong quietly - a `python3` that is the Microsoft
+Store stub, and Windows Smart App Control refusing to execute a freshly linked binary - and
+prints the fix for each.
+
+## Build
+
+Requires CMake 3.20+, Ninja, and a C++20 compiler (GCC 10+ / Clang 12+ / MSVC 19.30+).
+
+```bash
+scripts/configure.sh build Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure
+```
+
+`scripts/configure.sh` picks a C++20-capable compiler rather than trusting PATH order,
+which matters on Windows boxes carrying an old MinGW. It also reuses dependency sources
+from any build tree already on disk, so a second build directory costs seconds rather than
+re-cloning 200 MB. 453 tests, all passing - `ctest --test-dir build` is the check, and
+the number is worth reading with a command beside it rather than taken on trust.
+
+## Use
+
+```bash
+./build/nirnay version
+./build/nirnay options
+./build/nirnay info  demo/crude_blend.mps
+./build/nirnay solve demo/crude_blend.mps --write-sol blend.sol --stats blend.json
+./build/nirnay solve demo/crude_blend.mps --progress-out progress.jsonl
+```
+
+`demo/crude_blend.mps` is a small crude-blending LP: three crudes into a diesel pool, with a
+CDU throughput window, a diesel commitment and a sulphur specification. It ships as both MPS
+and LP so the two readers can be checked against each other, and it exercises the format
+features most likely to be misread - a `RANGES` entry on a `G` row, an equality row,
+`OBJSENSE MAX`, and `LO`/`UP` bounds.
+
+`solve` returns a meaningful exit code: `0` optimal, `1` a limit or a proven
+infeasible/unbounded model, `3` the file could not be read, `5` a numerical or model error.
+
+Beyond the objective, the solution file carries the **shadow price of every row**. On the
+blending model those are the numbers a refinery planner acts on: what one more unit of
+diesel commitment costs, and what the sulphur specification is worth.
+
+A verdict of *infeasible* or *unbounded* is not taken on trust either. Since #192 the
+solution file carries a **certificate** with it - a Farkas vector for an infeasible model, a
+ray for an unbounded one - and `tools/verify_solution.py`, which shares no code with the
+solver, checks the certificate against the original model the same way it checks an
+optimal point. The header says `certificate farkas`, `ray` or `none`, so a verdict that
+arrives without one (a model presolve proved infeasible, say) is visible as such.
+
+A MILP stopped by a gap target (`--option mip_relative_gap=0.01`) reports *optimal within
+the gap* and the file records the gap it was asked for (#188); a run that stops on a limit
+reports the incumbent as what it is. Time limits reach inside the sparse LDL^T factorization
+(#197), so an interior-point solve on a model whose factor is too large stops on time
+rather than when the factorization happens to finish; the sparse LU used by the simplex
+does not yet honour it the same way (#208).
+
+`--progress-out` appends one JSON line per logged iteration or node to a file as the solve
+runs, flushed immediately - an operator can `tail -f` it during a long solve to watch the
+bound close in on the answer without waiting for the final report.
+
+## Demo
+
+```bash
+demo/run_sih_demo.sh         # the full PS26119 walkthrough, in the problem statement's order
+demo/run_demo.sh --list      # or pick a single instance
+demo/run_demo.sh share2b     # solve it live, then verify it independently
+```
+
+The nine Netlib instances are committed, so the demo needs no network. Every number it prints
+comes from a command it just ran.
+
+On Windows, run it as `PYTHON=python demo/run_sih_demo.sh` if `python3` on your PATH is the
+Microsoft Store stub; `scripts/preflight.sh` tells you whether it is.
+
+## Layout
+
+```
+include/nirnay/  public headers — Model, Solution, Options, tolerances, sparse containers
+                  plus nirnay.h, the C API
+src/api           C API — an FFI-safe surface over the core, no C++ types crossing
+src/core          Model/Solution implementation, the solve() dispatcher, certificates (#192)
+src/util          logging, timers, arena allocator, option registry
+src/io            MPS + LP readers (including QPS QUADOBJ), solution and JSON writers
+src/presolve      reductions + postsolve               (on by default)
+src/simplex       primal and dual revised simplex (the dual is the branch-and-bound node engine)
+src/la            sparse containers, sparse Markowitz LU (hyper-sparse FTRAN), sparse LDL^T, dense LU (test oracle only)
+src/pdhg          restarted PDHG, CPU; its answer is finished by the interior point (#229)
+                                                       (CUDA backend: not started)
+src/mip           branch and bound + diving heuristic + root cuts (cuts off by default, #159)
+src/qp            convex QP, Condat-Vu primal-dual     (done)
+src/ipm           Mehrotra interior point, sparse LDL^T (opt-in: algorithm=ipm, no basis)
+bindings/python   Python bindings — ctypes over the C API, nothing to compile
+tests/  bench/  tools/  docs/  demo/
+```
+
+## What this does NOT do
+
+Stated here rather than only in the demo, because a solver that is vague about its limits is
+not one an industrial user can plan around. [Issue #54](https://github.com/thegoodengineer/sih-26/issues/54)
+tracks every PS26119 requirement against what exists on `main`; section 6 of
+`demo/run_sih_demo.sh` prints this list at the end of every run.
+
+| not implemented | note |
+|---|---|
+| **GPU acceleration** | The first-order method it needs exists and runs on CPU - restarted PDHG, `--option algorithm=pdhg`, **9 of 9** committed instances to `optimal` at 1e-8 on `main` at `79ec7f7` (`bench/results/pdhg-79ec7f7.csv`, `docs/BENCHMARKS.md` section 1e). The ninth is `share2b`, which the first-order method alone leaves at its million-iteration limit: since #229 its answer is finished by the interior point by default (`pdhg_polish`), nine more iterations there, and section 1f.1 measures the same thing size by size - 6.1e-04 to 1.9e-10 at 1,000 rows, declined where the factor is not affordable. The CUDA backend is unwritten (#16-#19); `--gpu` warns and falls back. No speed-up is claimed. |
+| **Scale** | Measured to a million, and the answer depends on the engine (#198, `docs/BENCHMARKS.md` sections 1f and 1f.1). On generated instances whose optimum is exact by construction: under a 120 s clock the first-order engine reaches the optimum at **100,000 x 100,000** to 9.1e-08 without certifying it, the interior point reaches it at 5,000 since the AMD ordering (#193) and the dual simplex only at 1,000 (`bench/results/scale-f7ca7e9.csv`, 7 of 12). Given a fixed 1,000 iterations instead of a clock - the one accuracy claim here another machine reproduces exactly - the error stays between 6.9e-06 and 6.1e-04 all the way to **1,000,000 x 1,000,000**, so what grows with the model is the cost per iteration, not the number needed. Those are the random family's numbers, and a random sparse matrix is the worst case for anything that factorizes; on a second family shaped like a multi-period planning model (#198, section 1f.2, `bench/results/scale-staircase-6503800.csv`) the interior point reaches the optimum at **20,000** rows instead of 1,000 and 8 of 12 solves reach it against 6 of 12. The polish that finishes PDHG's answer (#229) is measured beside the unpolished run in section 1f.1 (`bench/results/scale-iterations-f7ca7e9.csv`): at 1,000 rows the same 1,000 iterations land at 6.1e-04 unpolished and 1.9e-10 polished, and at every larger size of the random family the polish declines within its 30 s budget because the factor is dense, which the table shows rather than hides. On real models: the largest Netlib instance solved is `fit2d`, 25x10500 with 129018 nonzeros, in 0.3 s, and on Mittelmann's eight smallest LPs, 6,330 to 376,500 rows, the result is 0 of 8 inside 300 s. On an industrial-structured model - a T-period refinery planning LP with crudes, tanks, yields, capacities, quality budgets and delivery commitments, optimum exact by construction (`bench/runners/generate_refinery_lp.py`, #211, section 1f.3, `bench/results/scale-refinery-f7ca7e9.csv`) - the monthly year (1,068 rows) is solved exactly by all three engines, the daily year (**32,485 rows**) exactly by the interior point (45 iterations, 93 s) and by PDHG finished by it (95 s), and the hourly year (**779,640 rows**) is reached by PDHG to 1.1e-06 inside 120 s and proved by nothing: 5 of 9 solves. That is the first industrial-shaped model at this size the evidence holds, and the number to read is the daily year. |
+| **Interior point as a default** | An interior-point method exists (#56, `--option algorithm=ipm`, Mehrotra predictor-corrector over a from-scratch sparse LDL^T) and is opt-in: it produces no basis, so it cannot warm-start branch and bound and cannot certify infeasibility, and on the full Netlib set it verifies fewer instances than the dual simplex (`docs/PS26119_COVERAGE.md`). The default continuous engine is the simplex. It does two things by default now that it did not: it stops the moment its iterate is not a number and returns the best finite one (#205, found on the 20,000-row staircase model), and it finishes PDHG's answers from PDHG's own point (#229), declining within `polish_max_seconds` when the factor is not affordable. |
+| **Cutting planes by default** | Root Gomory mixed-integer and lifted knapsack cover cuts exist (#159, `--option enable_root_cuts=true`) and are off by default: on the 30-instance MIPLIB set at 60 s on `main` at `f7ca7e9` they prove the same 9 instances, take the node count to 0.918x, and cost one published match (`noswot`, whose incumbent is -39 with them and -41 without), because a cut row makes every node LP dearer (`bench/results/miplib-cuts-{off,on}.csv`; `docs/BENCHMARKS.md` section 2). No MIR cuts, and none below the root (#221). Branch and bound itself has reliability branching (#69) and warm-started dual node LPs (#65). This is why MIPLIB proves few optima. |
+| **Non-convex QP** | Refused deliberately, with an LDL^T certificate. A local optimum reported as a global one is not something this solver will do. |
+| **MIQP bound quality** | MIQP is implemented, but its node bound comes from a first-order method and is only accurate to the tolerance it converged to, so pruning is deliberately kept on the conservative side and costs nodes. With root cuts off by default too, expect incumbents more often than proofs. |
+| **Parallelism** | Single-threaded by default. `--option threads=N` runs the column loops of an iteration under OpenMP, deterministically - results are bit-identical at 1 and 8 threads - and at Netlib scale it is measured to buy nothing, because an iteration is too short to amortize the fork (#57). It is a correctness-preserving switch, not a speed claim. |
+
+On speed against HiGHS: on the medium tier the objectives agree on all 50 instances, and
+the speed ratio is, for the first time, a number two runs an hour apart agree on. Three
+runs of the same binary on `main` at `f7ca7e9` (`bench/results/compare-highs-medium-
+f7ca7e9.csv`, `-second.csv`, `-third.csv`; 16:17, 16:41 and 17:21 on the same afternoon,
+alone on the machine, on mains) put the median per-instance ratio at **2.01x, 2.04x and
+2.12x** - NIRNAY slower - with total solve time 2.64x, 2.56x and 2.62x. The first and the
+third are an hour apart and agree within 6%, which is the bar #212 set for quoting it;
+the earlier committed pair, three days apart, had read 1.38x and 2.11x, and that spread is
+why the number was not quoted before. Read it as *about twice HiGHS's time on these
+instances, on this laptop*: 9 to 16 of the 50 timing envelopes still overlap outright,
+the instances solve in single-digit milliseconds, and the ratio belongs to this machine
+state as much as to the solver.
+The reproducible comparison is iteration count, where the gap narrowed by a third when
+devex pricing became the default (#66); HiGHS's devex still takes fewer.
+
+## Licence
+
+Apache-2.0.
